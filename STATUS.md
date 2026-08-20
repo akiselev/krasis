@@ -5,11 +5,11 @@ Milestone: clean repository bootstrap
 
 ## Implemented
 
-- deterministic coupled block layout with overlap validation;
+- deterministic, contiguous state layout with identity and schema validation;
 - committed/trial field state with explicit begin, commit, and rollback;
-- bounded committed-state history;
+- layout-bound fields and bounded committed-state history;
 - constitutive state slots participating in the same transaction;
-- serializable checkpoints and restoration validation;
+- serializable checkpoints with history and atomic, prevalidated restoration;
 - event records separated from state identity.
 
 ## Boundary
@@ -25,10 +25,11 @@ Passed on 2026-08-20 with Rust 1.97.0:
 cargo fmt --check
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test                         # 1 passed
+cargo test --all-targets           # 4 passed
 ```
 
 ## Next
 
-Wrap one Finitum Poisson operator in Solverang's operator traits, then add transient state
-for diffusion before introducing genuinely coupled blocks.
+Connect generated Poisson realization to this transactional state, then add transient
+diffusion state and DAE behavior. Introduce Solverang implementations only with the real
+stateful residual/JVP composition they represent.

@@ -1,9 +1,9 @@
-use crate::{BlockLayout, Checkpoint, KrasisError};
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use crate::{Checkpoint, KrasisError, StateLayout};
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct FieldId(String);
 
 impl FieldId {
@@ -22,31 +22,35 @@ impl fmt::Display for FieldId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum TransactionPhase {
     Committed,
     Trial,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 struct FieldSlot {
     committed: Vec<f64>,
     trial: Option<Vec<f64>>,
     history: VecDeque<Vec<f64>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ConstitutiveSlot {
-    pub committed: Vec<f64>,
+    committed: Vec<f64>,
     trial: Option<Vec<f64>>,
 }
 
 impl ConstitutiveSlot {
-    pub fn new(committed: Vec<f64>) -> Self {
+    fn new(committed: Vec<f64>) -> Self {
         Self {
             committed,
             trial: None,
         }
+    }
+
+    pub fn committed(&self) -> &[f64] {
+        &self.committed
     }
 
     pub fn trial(&self) -> Option<&[f64]> {
@@ -54,8 +58,10 @@ impl ConstitutiveSlot {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// Layout-bound coupled state with atomic trial, commit, rollback, and restore.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SimulationState {
+    layout: StateLayout,
     phase: TransactionPhase,
     history_limit: usize,
     time: f64,
@@ -65,8 +71,9 @@ pub struct SimulationState {
 }
 
 impl SimulationState {
-    pub fn new(history_limit: usize) -> Self {
+    pub fn new(layout: StateLayout, history_limit: usize) -> Self {
         Self {
+            layout,
             phase: TransactionPhase::Committed,
             history_limit,
             time: 0.0,
@@ -74,6 +81,10 @@ impl SimulationState {
             fields: BTreeMap::new(),
             constitutive: BTreeMap::new(),
         }
+    }
+
+    pub fn layout(&self) -> &StateLayout {
+        &self.layout
     }
 
     pub fn phase(&self) -> TransactionPhase {
@@ -89,9 +100,23 @@ impl SimulationState {
     }
 
     pub fn insert_field(&mut self, id: FieldId, values: Vec<f64>) -> Result<(), KrasisError> {
+        self.require_committed_structure()?;
         if self.fields.contains_key(&id) {
             return Err(KrasisError::DuplicateField(id.to_string()));
         }
+        let block = self
+            .layout
+            .block(&crate::BlockId::new(id.as_str()))
+            .ok_or_else(|| KrasisError::FieldOutsideLayout(id.to_string()))?;
+        let expected = block.range().len();
+        if values.len() != expected {
+            return Err(KrasisError::FieldLength {
+                field: id.to_string(),
+                actual: values.len(),
+                expected,
+            });
+        }
+        require_finite(&format!("field `{id}`"), &values)?;
         self.fields.insert(
             id,
             FieldSlot {
@@ -103,15 +128,32 @@ impl SimulationState {
         Ok(())
     }
 
-    pub fn insert_constitutive(&mut self, id: impl Into<String>, values: Vec<f64>) {
-        self.constitutive
-            .insert(id.into(), ConstitutiveSlot::new(values));
+    pub fn insert_constitutive(
+        &mut self,
+        id: impl Into<String>,
+        values: Vec<f64>,
+    ) -> Result<(), KrasisError> {
+        self.require_committed_structure()?;
+        let id = id.into();
+        if self.constitutive.contains_key(&id) {
+            return Err(KrasisError::DuplicateConstitutive(id));
+        }
+        require_finite(&format!("constitutive slot `{id}`"), &values)?;
+        self.constitutive.insert(id, ConstitutiveSlot::new(values));
+        Ok(())
     }
 
     pub fn committed(&self, id: &FieldId) -> Result<&[f64], KrasisError> {
         self.fields
             .get(id)
             .map(|slot| slot.committed.as_slice())
+            .ok_or_else(|| KrasisError::UnknownField(id.to_string()))
+    }
+
+    pub fn history(&self, id: &FieldId) -> Result<&VecDeque<Vec<f64>>, KrasisError> {
+        self.fields
+            .get(id)
+            .map(|slot| &slot.history)
             .ok_or_else(|| KrasisError::UnknownField(id.to_string()))
     }
 
@@ -127,6 +169,7 @@ impl SimulationState {
         if self.phase == TransactionPhase::Trial {
             return Err(KrasisError::TrialAlreadyActive);
         }
+        self.ensure_complete()?;
         for slot in self.fields.values_mut() {
             slot.trial = Some(slot.committed.clone());
         }
@@ -152,6 +195,7 @@ impl SimulationState {
                 expected: slot.committed.len(),
             });
         }
+        require_finite(&format!("trial field `{id}`"), values)?;
         slot.trial = Some(values.to_vec());
         Ok(())
     }
@@ -163,7 +207,7 @@ impl SimulationState {
         let slot = self
             .constitutive
             .get_mut(id)
-            .ok_or_else(|| KrasisError::UnknownField(id.to_owned()))?;
+            .ok_or_else(|| KrasisError::UnknownConstitutive(id.to_owned()))?;
         if values.len() != slot.committed.len() {
             return Err(KrasisError::FieldLength {
                 field: id.to_owned(),
@@ -171,6 +215,7 @@ impl SimulationState {
                 expected: slot.committed.len(),
             });
         }
+        require_finite(&format!("trial constitutive slot `{id}`"), values)?;
         slot.trial = Some(values.to_vec());
         Ok(())
     }
@@ -179,18 +224,52 @@ impl SimulationState {
         if self.phase != TransactionPhase::Trial {
             return Err(KrasisError::NoActiveTrial);
         }
-        for slot in self.fields.values_mut() {
+        if !time.is_finite() || time < self.time {
+            return Err(KrasisError::InvalidCommitTime {
+                time,
+                current: self.time,
+            });
+        }
+
+        let field_trials = self
+            .fields
+            .iter()
+            .map(|(id, slot)| {
+                slot.trial
+                    .clone()
+                    .map(|values| (id.clone(), values))
+                    .ok_or(KrasisError::NoActiveTrial)
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let constitutive_trials = self
+            .constitutive
+            .iter()
+            .map(|(id, slot)| {
+                slot.trial
+                    .clone()
+                    .map(|values| (id.clone(), values))
+                    .ok_or(KrasisError::NoActiveTrial)
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let next_step = self
+            .step
+            .checked_add(1)
+            .ok_or_else(|| KrasisError::MalformedCheckpoint("step counter overflowed".into()))?;
+
+        for (id, slot) in &mut self.fields {
             if self.history_limit > 0 {
                 slot.history.push_front(slot.committed.clone());
                 slot.history.truncate(self.history_limit);
             }
-            slot.committed = slot.trial.take().ok_or(KrasisError::NoActiveTrial)?;
+            slot.committed = field_trials[id].clone();
+            slot.trial = None;
         }
-        for slot in self.constitutive.values_mut() {
-            slot.committed = slot.trial.take().ok_or(KrasisError::NoActiveTrial)?;
+        for (id, slot) in &mut self.constitutive {
+            slot.committed = constitutive_trials[id].clone();
+            slot.trial = None;
         }
         self.time = time;
-        self.step += 1;
+        self.step = next_step;
         self.phase = TransactionPhase::Committed;
         Ok(())
     }
@@ -209,18 +288,25 @@ impl SimulationState {
         Ok(())
     }
 
-    pub fn checkpoint(&self, layout: &BlockLayout) -> Result<Checkpoint, KrasisError> {
+    pub fn checkpoint(&self) -> Result<Checkpoint, KrasisError> {
         if self.phase != TransactionPhase::Committed {
             return Err(KrasisError::TrialAlreadyActive);
         }
+        self.ensure_complete()?;
         Ok(Checkpoint {
-            layout_identity: layout.identity().to_owned(),
+            layout_identity: self.layout.identity().to_owned(),
+            history_limit: self.history_limit,
             time: self.time,
             step: self.step,
             fields: self
                 .fields
                 .iter()
                 .map(|(id, slot)| (id.to_string(), slot.committed.clone()))
+                .collect(),
+            field_history: self
+                .fields
+                .iter()
+                .map(|(id, slot)| (id.to_string(), slot.history.iter().cloned().collect()))
                 .collect(),
             constitutive: self
                 .constitutive
@@ -230,49 +316,129 @@ impl SimulationState {
         })
     }
 
-    pub fn restore(
-        &mut self,
-        layout: &BlockLayout,
-        checkpoint: &Checkpoint,
-    ) -> Result<(), KrasisError> {
-        if checkpoint.layout_identity != layout.identity() {
+    pub fn restore(&mut self, checkpoint: &Checkpoint) -> Result<(), KrasisError> {
+        self.require_committed_structure()?;
+        if checkpoint.layout_identity != self.layout.identity() {
             return Err(KrasisError::LayoutMismatch {
                 actual: checkpoint.layout_identity.clone(),
-                expected: layout.identity().to_owned(),
+                expected: self.layout.identity().to_owned(),
             });
         }
-        for (id, slot) in &mut self.fields {
+        if !checkpoint.time.is_finite() {
+            return Err(KrasisError::MalformedCheckpoint(
+                "checkpoint time is not finite".into(),
+            ));
+        }
+
+        let expected_fields: BTreeSet<_> = self
+            .layout
+            .blocks()
+            .iter()
+            .map(|block| block.id().as_str().to_owned())
+            .collect();
+        let checkpoint_fields: BTreeSet<_> = checkpoint.fields.keys().cloned().collect();
+        let checkpoint_histories: BTreeSet<_> = checkpoint.field_history.keys().cloned().collect();
+        if checkpoint_fields != expected_fields || checkpoint_histories != expected_fields {
+            return Err(KrasisError::MalformedCheckpoint(
+                "checkpoint fields do not exactly match the state layout".into(),
+            ));
+        }
+
+        let expected_constitutive: BTreeSet<_> = self.constitutive.keys().cloned().collect();
+        let checkpoint_constitutive: BTreeSet<_> =
+            checkpoint.constitutive.keys().cloned().collect();
+        if checkpoint_constitutive != expected_constitutive {
+            return Err(KrasisError::MalformedCheckpoint(
+                "checkpoint constitutive slots do not match the active schema".into(),
+            ));
+        }
+
+        let mut fields = BTreeMap::new();
+        for block in self.layout.blocks() {
+            let id = FieldId::new(block.id().as_str());
             let values = checkpoint.fields.get(id.as_str()).ok_or_else(|| {
                 KrasisError::MalformedCheckpoint(format!("field `{id}` is missing"))
             })?;
-            if values.len() != slot.committed.len() {
-                return Err(KrasisError::FieldLength {
-                    field: id.to_string(),
-                    actual: values.len(),
-                    expected: slot.committed.len(),
-                });
+            let expected = block.range().len();
+            validate_field_values(id.as_str(), values, expected)?;
+            let histories = checkpoint.field_history.get(id.as_str()).ok_or_else(|| {
+                KrasisError::MalformedCheckpoint(format!("history for field `{id}` is missing"))
+            })?;
+            if histories.len() > checkpoint.history_limit {
+                return Err(KrasisError::MalformedCheckpoint(format!(
+                    "history for field `{id}` exceeds the checkpoint limit"
+                )));
             }
-            slot.committed.clone_from(values);
-            slot.trial = None;
-            slot.history.clear();
+            for history in histories {
+                validate_field_values(id.as_str(), history, expected)?;
+            }
+            fields.insert(
+                id,
+                FieldSlot {
+                    committed: values.clone(),
+                    trial: None,
+                    history: histories.iter().cloned().collect(),
+                },
+            );
         }
-        for (id, slot) in &mut self.constitutive {
+
+        let mut constitutive = BTreeMap::new();
+        for (id, current) in &self.constitutive {
             let values = checkpoint.constitutive.get(id).ok_or_else(|| {
                 KrasisError::MalformedCheckpoint(format!("constitutive slot `{id}` is missing"))
             })?;
-            if values.len() != slot.committed.len() {
-                return Err(KrasisError::FieldLength {
-                    field: id.clone(),
-                    actual: values.len(),
-                    expected: slot.committed.len(),
-                });
-            }
-            slot.committed.clone_from(values);
-            slot.trial = None;
+            validate_field_values(id, values, current.committed.len())?;
+            constitutive.insert(id.clone(), ConstitutiveSlot::new(values.clone()));
         }
+
+        self.fields = fields;
+        self.constitutive = constitutive;
+        self.history_limit = checkpoint.history_limit;
         self.time = checkpoint.time;
         self.step = checkpoint.step;
         self.phase = TransactionPhase::Committed;
         Ok(())
     }
+
+    fn require_committed_structure(&self) -> Result<(), KrasisError> {
+        if self.phase == TransactionPhase::Trial {
+            Err(KrasisError::StructureDuringTrial)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_complete(&self) -> Result<(), KrasisError> {
+        for block in self.layout.blocks() {
+            if !self
+                .fields
+                .keys()
+                .any(|id| id.as_str() == block.id().as_str())
+            {
+                return Err(KrasisError::MissingField(block.id().to_string()));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_field_values(id: &str, values: &[f64], expected: usize) -> Result<(), KrasisError> {
+    if values.len() != expected {
+        return Err(KrasisError::FieldLength {
+            field: id.to_owned(),
+            actual: values.len(),
+            expected,
+        });
+    }
+    require_finite(id, values)
+}
+
+fn require_finite(label: &str, values: &[f64]) -> Result<(), KrasisError> {
+    if let Some(index) = values.iter().position(|value| !value.is_finite()) {
+        return Err(KrasisError::NonFiniteValue {
+            label: label.to_owned(),
+            index,
+        });
+    }
+    Ok(())
 }
