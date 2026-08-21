@@ -1,7 +1,7 @@
 # Krasis status
 
 Updated: 2026-08-21
-Milestone: FC10 cross-dialect composition complete
+Milestone: FC11 restart serialization validated
 
 ## Implemented
 
@@ -28,7 +28,9 @@ Milestone: FC10 cross-dialect composition complete
 Resolvent owns scientific/coupling meaning, Finitum owns concrete discrete operators,
 Krasis owns stateful composition, and Solverang owns the algorithms acting on it.
 
-The FC10 cross-dialect contract was validated against Resolvent `201540e` and Finitum `c4f5674`.
+The cross-dialect and serialized-checkpoint contracts were validated against Resolvent
+`57c9b431e77a91d27fe20c4ca206e8b55c3e4cd7` and Finitum
+`a39df632b90ceedf779bcceaf7f146433615d743`.
 
 ## Validation
 
@@ -38,10 +40,10 @@ Passed on 2026-08-21 with Rust 1.97.0:
 cargo fmt --check
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets           # 11 passed, 0 failed
+cargo test --all-targets           # 12 passed, 0 failed
 ```
 
 ## Next
 
-Start FC11 restart/evidence serialization for cross-dialect operators. Extend coupling effects or
-transactional state only from a concrete product case.
+Extend coupling effects or transactional state only from a concrete product case; preserve the
+validated checkpoint identity and atomic restore contract.
