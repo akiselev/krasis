@@ -64,6 +64,24 @@ fn malformed_restore_does_not_partially_mutate_state() {
 }
 
 #[test]
+fn constitutive_state_uses_the_same_commit_and_rollback_boundary() {
+    let layout = StateLayout::new(vec![StateBlock::new(BlockId::new("u"), 0..1)]).unwrap();
+    let mut state = SimulationState::new(layout, 1);
+    state.insert_field(FieldId::new("u"), vec![1.0]).unwrap();
+    state.insert_constitutive("material", vec![3.0]).unwrap();
+
+    state.begin_trial().unwrap();
+    state.set_constitutive_trial("material", &[9.0]).unwrap();
+    state.rollback().unwrap();
+    assert_eq!(state.constitutive("material").unwrap().committed(), &[3.0]);
+
+    state.begin_trial().unwrap();
+    state.set_constitutive_trial("material", &[5.0]).unwrap();
+    state.commit(0.25).unwrap();
+    assert_eq!(state.constitutive("material").unwrap().committed(), &[5.0]);
+}
+
+#[test]
 fn step_overflow_leaves_the_trial_uncommitted() {
     let layout = StateLayout::new(vec![StateBlock::new(BlockId::new("u"), 0..1)]).unwrap();
     let field = FieldId::new("u");

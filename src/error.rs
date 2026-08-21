@@ -50,4 +50,8 @@ pub enum KrasisError {
     LayoutMismatch { actual: String, expected: String },
     #[error("checkpoint state is malformed: {0}")]
     MalformedCheckpoint(String),
+    #[error("coupled operator configuration is invalid: {0}")]
+    InvalidCoupling(String),
+    #[error("coupled numerical solve failed: {0}")]
+    Solve(String),
 }

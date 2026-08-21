@@ -157,12 +157,86 @@ impl SimulationState {
             .ok_or_else(|| KrasisError::UnknownField(id.to_string()))
     }
 
+    pub fn constitutive(&self, id: &str) -> Result<&ConstitutiveSlot, KrasisError> {
+        self.constitutive
+            .get(id)
+            .ok_or_else(|| KrasisError::UnknownConstitutive(id.to_owned()))
+    }
+
     pub fn trial(&self, id: &FieldId) -> Result<&[f64], KrasisError> {
         let slot = self
             .fields
             .get(id)
             .ok_or_else(|| KrasisError::UnknownField(id.to_string()))?;
         slot.trial.as_deref().ok_or(KrasisError::NoActiveTrial)
+    }
+
+    /// Flatten committed fields in canonical layout-block order.
+    pub fn committed_vector(&self) -> Result<Vec<f64>, KrasisError> {
+        self.ensure_complete()?;
+        let mut values = Vec::with_capacity(self.layout.width());
+        for block in self.layout.blocks() {
+            let id = FieldId::new(block.id().as_str());
+            values.extend_from_slice(self.committed(&id)?);
+        }
+        Ok(values)
+    }
+
+    /// Flatten one committed-history level in canonical layout order.
+    pub fn history_vector(&self, index: usize) -> Result<Option<Vec<f64>>, KrasisError> {
+        self.ensure_complete()?;
+        let mut values = Vec::with_capacity(self.layout.width());
+        let mut present = None;
+        for block in self.layout.blocks() {
+            let id = FieldId::new(block.id().as_str());
+            let history = self.history(&id)?;
+            let block_present = history.get(index);
+            match (present, block_present) {
+                (None, None) => present = Some(false),
+                (None, Some(block_values)) => {
+                    present = Some(true);
+                    values.extend_from_slice(block_values);
+                }
+                (Some(false), None) => {}
+                (Some(true), Some(block_values)) => values.extend_from_slice(block_values),
+                _ => {
+                    return Err(KrasisError::MalformedCheckpoint(
+                        "field histories have inconsistent depths".into(),
+                    ));
+                }
+            }
+        }
+        Ok(present.unwrap_or(false).then_some(values))
+    }
+
+    /// Replace every trial field from one canonical layout-ordered vector.
+    pub fn set_trial_vector(&mut self, values: &[f64]) -> Result<(), KrasisError> {
+        if self.phase != TransactionPhase::Trial {
+            return Err(KrasisError::NoActiveTrial);
+        }
+        if values.len() != self.layout.width() {
+            return Err(KrasisError::FieldLength {
+                field: "coupled state".into(),
+                actual: values.len(),
+                expected: self.layout.width(),
+            });
+        }
+        require_finite("coupled trial state", values)?;
+        let assignments = self
+            .layout
+            .blocks()
+            .iter()
+            .map(|block| {
+                (
+                    FieldId::new(block.id().as_str()),
+                    values[block.range()].to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (id, block_values) in assignments {
+            self.set_trial(&id, &block_values)?;
+        }
+        Ok(())
     }
 
     pub fn begin_trial(&mut self) -> Result<(), KrasisError> {

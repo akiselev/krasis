@@ -2,6 +2,8 @@
 
 Krasis is the stateful coupling layer of the Sinbad stack. It owns field instances,
 state layout, trial/commit/rollback, constitutive history, events, and checkpoints,
-and eventually the aggregation of Finitum operators into Solverang-facing nonlinear
-and DAE systems. Those public systems will land with real stateful composition; Krasis
-does not expose forwarding adapters as architectural placeholders.
+plus the aggregation of Finitum operators into direct Solverang nonlinear, block, and
+DAE implementations. `CoupledExecution` encloses BDF attempts in the state transaction
+and checkpoints Krasis state together with Solverang history. Checkpoints bind to Finitum's
+concrete realization digest, so same-size mesh, constraint, coefficient, or material changes are
+refused. No forwarding adapter or copied numerical contract sits between the owning repositories.

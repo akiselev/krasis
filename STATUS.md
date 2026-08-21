@@ -1,7 +1,7 @@
 # Krasis status
 
-Updated: 2026-08-20
-Milestone: clean repository bootstrap
+Updated: 2026-08-21
+Milestone: FC7 coupled execution complete
 
 ## Implemented
 
@@ -11,6 +11,14 @@ Milestone: clean repository bootstrap
 - constitutive state slots participating in the same transaction;
 - serializable checkpoints with history and atomic, prevalidated restoration;
 - event records separated from state identity.
+- canonical flattening of committed/trial/history fields in state-layout order;
+- direct Solverang `NonlinearOperator`, `BlockNonlinearOperator`, and `DaeOperator`
+  implementations over a real Finitum realization;
+- BDF attempts enclosed by field and constitutive trial/commit/rollback transactions;
+- coupled checkpoints that atomically validate and restore Krasis state plus Solverang BDF
+  values, step-size history, time, and accepted-step identity;
+- checkpoint operator identities incorporating Finitum's concrete plan digest and the Krasis
+  state layout, with same-size geometry and dynamic-material mismatch refusals.
 
 ## Boundary
 
@@ -19,17 +27,16 @@ Krasis owns stateful composition, and Solverang owns the algorithms acting on it
 
 ## Validation
 
-Passed on 2026-08-20 with Rust 1.97.0:
+Passed on 2026-08-21 with Rust 1.97.0:
 
 ```text
 cargo fmt --check
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets           # 4 passed
+cargo test --all-targets           # 8 passed
 ```
 
 ## Next
 
-Connect generated Poisson realization to this transactional state, then add transient
-diffusion state and DAE behavior. Introduce Solverang implementations only with the real
-stateful residual/JVP composition they represent.
+Extend coupled layouts and constitutive updates only when FC8 mixed/facet systems provide the
+realized actions they require.
