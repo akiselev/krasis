@@ -16,7 +16,7 @@ thiserror = "2"
 
 [dev-dependencies]
 quantitas = { path = "../quantitas" }
-resolvent = { path = "../resolvent" }
+scientia = { path = "../scientia" }
 
 [lints.rust]
 unsafe_code = "forbid"

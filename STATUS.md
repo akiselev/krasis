@@ -1,7 +1,7 @@
 # Krasis status
 
 Updated: 2026-08-21
-Milestone: FC11 restart serialization validated
+Milestone: R1 Scientia consumer migration
 
 ## Implemented
 
@@ -25,22 +25,25 @@ Milestone: FC11 restart serialization validated
 
 ## Boundary
 
-Resolvent owns scientific/coupling meaning, Finitum owns concrete discrete operators,
+Scientia owns scientific/coupling meaning, Finitum owns concrete discrete operators,
 Krasis owns stateful composition, and Solverang owns the algorithms acting on it.
 
-The cross-dialect and serialized-checkpoint contracts were validated against Resolvent
-`57c9b431e77a91d27fe20c4ca206e8b55c3e4cd7` and Finitum
-`a39df632b90ceedf779bcceaf7f146433615d743`.
+The cross-dialect and serialized-checkpoint contracts were validated against Scientia
+`215433962c874dfd86b59ffc6d69f017bba2b95a` and Finitum
+`bbc242af14672229294dfb80e48941ba9e6b1ee6`.
 
 ## Validation
 
 Passed on 2026-08-21 with Rust 1.97.0:
 
 ```text
-cargo fmt --check
-cargo check --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets           # 12 passed, 0 failed
+cargo fmt --all -- --check
+cargo check --locked --workspace --all-targets
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets           # 12 passed, 0 failed
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
+cargo test --locked --workspace --doc
+git diff --check
 ```
 
 ## Next

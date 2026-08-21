@@ -7,7 +7,7 @@ use krasis::{
     StateBlock, StateLayout, TransactionPhase,
 };
 use quantitas::UnitRegistry;
-use resolvent::{
+use scientia::{
     DerivativeEvaluation, InputSourceRequirement, compile_semantics, derive_variational_form,
     factor_operator, infer_form_requirements, lower_operator_kernels,
 };

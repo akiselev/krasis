@@ -4,7 +4,7 @@ use finitum::{
 };
 use krasis::CrossDialectOperator;
 use quantitas::UnitRegistry;
-use resolvent::{
+use scientia::{
     AffineMethodKernelSpec, compile_conservation_law_method, compile_network_dae_method,
     compile_semantics,
 };
