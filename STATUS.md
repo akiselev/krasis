@@ -38,5 +38,6 @@ cargo test --all-targets           # 8 passed
 
 ## Next
 
-Extend coupled layouts and constitutive updates only when FC8 mixed/facet systems provide the
-realized actions they require.
+FC8's mixed/facet/compatible artifact plans do not yet add global solved actions for Krasis.
+Extend coupled layouts or constitutive updates only when a concrete stateful mixed realization
+requires them.
