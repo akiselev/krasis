@@ -2,11 +2,11 @@
 
 use crate::KrasisError;
 use finitum::DiscreteOperator;
-use serde::Serialize;
-use solverang::{
+use methodus::{
     BlockLayout, BlockNonlinearOperator, BlockSpec, DaeOperator, EvaluationContext,
     NonlinearOperator, NumericError,
 };
+use serde::Serialize;
 
 /// Bidirectionally coupled pair of concrete operators from distinct method families.
 ///

@@ -1,10 +1,10 @@
 # Agent instructions
 
 Krasis owns coupled field/material state, history, transaction boundaries, events,
-checkpoints, and composition into Solverang-facing problems.
+checkpoints, and composition into Methodus-facing problems.
 
 Do not add scientific parsing or form semantics, mesh/basis/assembly implementations,
-kernel compilation, or numerical solver algorithms. Implement Solverang-owned traits
+kernel compilation, or numerical solver algorithms. Implement Methodus-owned traits
 directly instead of creating Krasis contract or bridge crates.
 
 Run formatting, clippy with warnings denied, and all tests before handoff. Keep `STATUS.md`

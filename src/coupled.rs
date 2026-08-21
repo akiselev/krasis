@@ -1,13 +1,13 @@
 use finitum::RealizationPlan;
-use serde::{Deserialize, Serialize};
-use solverang::{
+use methodus::{
     BdfConfig, BdfState, BlockLayout as SolverBlockLayout, BlockNonlinearOperator, BlockSpec,
     DaeOperator, EvaluationContext, NonlinearOperator, NumericError, StepOutcome, bdf_step,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{Checkpoint, KrasisError, SimulationState, StateLayout, TransactionPhase};
 
-/// Krasis-owned composition of a realized Finitum action into Solverang contracts.
+/// Krasis-owned composition of a realized Finitum action into Methodus contracts.
 ///
 /// Its [`NonlinearOperator`] implementation is the steady view at `t = 0` and `ydot = 0`.
 /// Time-dependent boundary, source, or material behavior must use its [`DaeOperator`] view.
@@ -86,7 +86,7 @@ impl NonlinearOperator for CoupledOperator {
         state: &[f64],
         output: &mut [f64],
     ) -> Result<(), NumericError> {
-        // Solverang's time-independent nonlinear contract is the steady view: t = 0, ydot = 0.
+        // Methodus's time-independent nonlinear contract is the steady view: t = 0, ydot = 0.
         // Time-dependent boundary/material behavior must use the DAE implementation below.
         self.realization
             .residual(0.0, state, &vec![0.0; self.dimension()], output)
@@ -154,7 +154,7 @@ impl DaeOperator for CoupledOperator {
     }
 }
 
-/// Serializable restart data for both Krasis transactions and Solverang BDF history.
+/// Serializable restart data for both Krasis transactions and Methodus BDF history.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CoupledCheckpoint {
     pub operator_identity: String,
@@ -215,7 +215,7 @@ impl CoupledExecution {
         &self.integrator
     }
 
-    /// Attempt one Solverang BDF step inside the Krasis trial transaction.
+    /// Attempt one Methodus BDF step inside the Krasis trial transaction.
     pub fn attempt_step(
         &mut self,
         context: &EvaluationContext,
@@ -296,7 +296,7 @@ fn validate_pair(
         || integrator.accepted_steps != state.step()
     {
         return Err(KrasisError::InvalidCoupling(
-            "Krasis committed state and Solverang BDF state are not synchronized".into(),
+            "Krasis committed state and Methodus BDF state are not synchronized".into(),
         ));
     }
     if integrator.values.iter().any(|value| !value.is_finite()) {
@@ -320,7 +320,7 @@ fn validate_pair(
                 && state.history_vector(0)?.as_deref() == Some(previous.as_slice()) => {}
         _ => {
             return Err(KrasisError::InvalidCoupling(
-                "Krasis field history and Solverang BDF history are inconsistent".into(),
+                "Krasis field history and Methodus BDF history are inconsistent".into(),
             ));
         }
     }

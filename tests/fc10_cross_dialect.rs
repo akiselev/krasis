@@ -3,14 +3,14 @@ use finitum::{
     NetworkDaeRealization,
 };
 use krasis::CrossDialectOperator;
+use methodus::{
+    BdfConfig, BdfOrder, BdfState, DaeOperator, EvaluationContext, StepOutcome, bdf_step,
+    verify_dae_jvp,
+};
 use quantitas::UnitRegistry;
 use scientia::{
     AffineMethodKernelSpec, compile_conservation_law_method, compile_network_dae_method,
     compile_semantics,
-};
-use solverang::{
-    BdfConfig, BdfOrder, BdfState, DaeOperator, EvaluationContext, StepOutcome, bdf_step,
-    verify_dae_jvp,
 };
 
 const SOURCE: &str = r#"
@@ -124,7 +124,7 @@ fn identity_is_canonical_and_covers_coupling_matrices() {
 }
 
 #[test]
-fn solverang_advances_the_cross_dialect_system_without_method_specific_policy() {
+fn methodus_advances_the_cross_dialect_system_without_method_specific_policy() {
     let operator = operator();
     let context = EvaluationContext::reproducible();
     let state = BdfState::initialize(&operator, &context, 0.0, vec![1.0, 0.0, 0.5]).unwrap();
