@@ -92,12 +92,7 @@ fn explicit_off_diagonal_blocks_form_a_real_bidirectional_dae() {
         )
         .unwrap();
     assert_eq!(residual, vec![2.1, -1.8, 4.55]);
-    assert!(
-        operator
-            .identity()
-            .contains("conservation_law_finite_volume")
-    );
-    assert!(operator.identity().contains("network_dae"));
+    assert!(operator.identity().starts_with("blake3:"));
     let discrepancy = verify_dae_jvp(
         &operator,
         &context,
@@ -110,6 +105,22 @@ fn explicit_off_diagonal_blocks_form_a_real_bidirectional_dae() {
     )
     .unwrap();
     assert!(discrepancy < 1.0e-9);
+}
+
+#[test]
+fn identity_is_canonical_and_covers_coupling_matrices() {
+    let baseline = operator();
+    assert_eq!(baseline.identity(), operator().identity());
+
+    let (finite_volume, network) = blocks();
+    let changed = CrossDialectOperator::new(
+        finite_volume,
+        network,
+        vec![vec![0.75], vec![-0.5]],
+        vec![vec![0.25, -0.25]],
+    )
+    .unwrap();
+    assert_ne!(baseline.identity(), changed.identity());
 }
 
 #[test]

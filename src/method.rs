@@ -2,6 +2,7 @@
 
 use crate::KrasisError;
 use finitum::DiscreteOperator;
+use serde::Serialize;
 use solverang::{
     BlockLayout, BlockNonlinearOperator, BlockSpec, DaeOperator, EvaluationContext,
     NonlinearOperator, NumericError,
@@ -66,13 +67,7 @@ impl CrossDialectOperator {
             },
         ])
         .map_err(|error| KrasisError::InvalidCoupling(error.to_string()))?;
-        let identity = format!(
-            "krasis-cross-dialect/1:left-family={}:left={}:right-family={}:right={}:lr={left_from_right:?}:rl={right_from_left:?}",
-            left.family_identity(),
-            left.identity(),
-            right.family_identity(),
-            right.identity()
-        );
+        let identity = cross_dialect_identity(&left, &right, &left_from_right, &right_from_left);
         Ok(Self {
             left,
             right,
@@ -117,6 +112,36 @@ impl CrossDialectOperator {
         require_len(label, values.len(), DaeOperator::dimension(self))?;
         Ok(values.split_at_mut(self.left.dimension()))
     }
+}
+
+fn cross_dialect_identity(
+    left: &DiscreteOperator,
+    right: &DiscreteOperator,
+    left_from_right: &[Vec<f64>],
+    right_from_left: &[Vec<f64>],
+) -> String {
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        schema: &'static str,
+        left_family: &'a str,
+        left_identity: String,
+        right_family: &'a str,
+        right_identity: String,
+        left_from_right: &'a [Vec<f64>],
+        right_from_left: &'a [Vec<f64>],
+    }
+
+    let bytes = serde_json::to_vec(&Payload {
+        schema: "krasis-cross-dialect/2",
+        left_family: left.family_identity(),
+        left_identity: left.identity(),
+        right_family: right.family_identity(),
+        right_identity: right.identity(),
+        left_from_right,
+        right_from_left,
+    })
+    .expect("validated cross-dialect identity payload is serializable");
+    format!("blake3:{}", blake3::hash(&bytes).to_hex())
 }
 
 impl DaeOperator for CrossDialectOperator {

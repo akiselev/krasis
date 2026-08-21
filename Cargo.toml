@@ -7,15 +7,16 @@ license = "MIT OR Apache-2.0"
 description = "Coupled field state and transactional simulation runtime for the Sinbad stack."
 
 [dependencies]
+blake3 = "1"
 finitum = { path = "../finitum" }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 solverang = { path = "../solverang" }
 thiserror = "2"
 
 [dev-dependencies]
 quantitas = { path = "../quantitas" }
 resolvent = { path = "../resolvent" }
-serde_json = "1"
 
 [lints.rust]
 unsafe_code = "forbid"
