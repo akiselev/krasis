@@ -1,7 +1,7 @@
 # Krasis status
 
 Updated: 2026-08-21
-Milestone: FC7 coupled execution complete
+Milestone: FC10 cross-dialect composition complete
 
 ## Implemented
 
@@ -19,11 +19,16 @@ Milestone: FC7 coupled execution complete
   values, step-size history, time, and accepted-step identity;
 - checkpoint operator identities incorporating Finitum's concrete plan digest and the Krasis
   state layout, with same-size geometry and dynamic-material mismatch refusals.
+- `CrossDialectOperator` composes distinct Finitum `DiscreteOperator` families with explicit,
+  finite, bidirectional off-diagonal matrices; it implements Solverang DAE, nonlinear, and block
+  contracts and rejects same-family or one-way placeholder configurations.
 
 ## Boundary
 
 Resolvent owns scientific/coupling meaning, Finitum owns concrete discrete operators,
 Krasis owns stateful composition, and Solverang owns the algorithms acting on it.
+
+The FC10 cross-dialect contract was validated against Resolvent `201540e` and Finitum `c4f5674`.
 
 ## Validation
 
@@ -33,11 +38,10 @@ Passed on 2026-08-21 with Rust 1.97.0:
 cargo fmt --check
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets           # 8 passed
+cargo test --all-targets           # 11 passed, 0 failed
 ```
 
 ## Next
 
-FC8's mixed/facet/compatible artifact plans do not yet add global solved actions for Krasis.
-Extend coupled layouts or constitutive updates only when a concrete stateful mixed realization
-requires them.
+Start FC11 restart/evidence serialization for cross-dialect operators. Extend coupling effects or
+transactional state only from a concrete product case.
