@@ -3,12 +3,13 @@ use finitum::{
     ExternalInput, Mesh, PreparedElement, RealizationPlan, VertexId,
 };
 use krasis::{
-    BlockId, CoupledCheckpoint, CoupledExecution, CoupledOperator, FieldId, SimulationState,
-    StateBlock, StateLayout, TransactionPhase,
+    BlockId, CoupledCheckpoint, CoupledExecution, CoupledOperator, FieldId,
+    FinitumVerificationSource, SimulationState, StateBlock, StateLayout, TransactionPhase,
+    check_history_and_rejection, check_restart_trajectory, check_rollback_identity,
 };
 use methodus::{
-    BdfConfig, BdfOrder, BlockNonlinearOperator, EvaluationContext, StepOutcome, verify_dae_jvp,
-    verify_jvp,
+    BdfConfig, BdfOrder, BlockNonlinearOperator, ComparisonTolerance, EvaluationContext,
+    StepOutcome, verify_dae_jvp, verify_jvp,
 };
 use quantitas::UnitRegistry;
 use scientia::{
@@ -141,6 +142,273 @@ fn checkpoint_refuses_same_size_geometry_and_material_changes() {
     let geometry_before = geometry.checkpoint().unwrap();
     assert!(geometry.restore(&checkpoint).is_err());
     assert_eq!(geometry.checkpoint().unwrap(), geometry_before);
+}
+
+#[test]
+fn sv0_transaction_restart_and_history_reports_are_identity_bound() {
+    let context = EvaluationContext::reproducible();
+    let (operator, state) = coupled_fixture();
+    let execution = CoupledExecution::new(operator, state, &context).unwrap();
+    let fixed = fixed_config(0.05);
+    let finitum = finitum_verification(&execution, 0.0);
+
+    let restart =
+        check_restart_trajectory(&execution, &context, 0.05, 4, 2, &fixed, &finitum).unwrap();
+    assert!(restart.passed, "{restart:#?}");
+    assert_eq!(restart.trajectory_l_infinity, 0.0);
+    assert!(
+        restart
+            .binding
+            .operator_identity
+            .starts_with("krasis-coupled/1:")
+    );
+    assert!(!restart.binding.layout_identity.is_empty());
+    assert!(restart.binding.config_identity.starts_with("blake3:"));
+    assert!(
+        restart
+            .binding
+            .finitum_verification
+            .as_ref()
+            .unwrap()
+            .report_digest
+            .hex
+            .len()
+            == 64
+    );
+    assert_eq!(restart.binding.finitum_verification_accepted, Some(true));
+    let encoded = serde_json::to_vec(&restart).unwrap();
+    let decoded: krasis::RestartTrajectoryReport = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(decoded, restart);
+    assert!(
+        restart
+            .validate(&execution, &context, 0.05, 4, 2, &fixed, &finitum)
+            .unwrap()
+            .accepted
+    );
+    assert!(
+        restart
+            .validate(
+                &execution,
+                &EvaluationContext::default(),
+                0.05,
+                4,
+                2,
+                &fixed,
+                &finitum,
+            )
+            .is_err()
+    );
+
+    let mut forged_pass = restart.clone();
+    forged_pass.passed = false;
+    rehash_restart(&mut forged_pass);
+    assert!(
+        forged_pass
+            .validate(&execution, &context, 0.05, 4, 2, &fixed, &finitum)
+            .is_err()
+    );
+    let mut forged_schema = restart.clone();
+    forged_schema.binding.schema = "krasis-verification/999".into();
+    rehash_restart(&mut forged_schema);
+    assert!(
+        forged_schema
+            .validate(&execution, &context, 0.05, 4, 2, &fixed, &finitum)
+            .is_err()
+    );
+    let mut forged_binding = restart.clone();
+    forged_binding.binding.operator_identity.push_str("-forged");
+    rehash_restart(&mut forged_binding);
+    assert!(
+        forged_binding
+            .validate(&execution, &context, 0.05, 4, 2, &fixed, &finitum)
+            .is_err()
+    );
+
+    let strict = BdfConfig {
+        order: BdfOrder::Two,
+        absolute_tolerance: 1.0e-16,
+        relative_tolerance: 1.0e-16,
+        minimum_step: 1.0e-8,
+        maximum_step: 0.05,
+        ..BdfConfig::default()
+    };
+    let history =
+        check_history_and_rejection(&execution, &context, 0.05, 2, &fixed, &strict, &finitum)
+            .unwrap();
+    assert!(history.passed, "{history:#?}");
+    assert_eq!(history.field_history_depths, vec![("u".into(), 2)]);
+    assert!(
+        history
+            .validate(&execution, &context, 0.05, 2, &fixed, &strict, &finitum,)
+            .unwrap()
+            .accepted
+    );
+
+    let mut after_one = execution.clone();
+    assert!(matches!(
+        after_one.attempt_step(&context, 0.05, &fixed).unwrap(),
+        StepOutcome::Accepted(_)
+    ));
+    let rollback = check_rollback_identity(&after_one, &context, 0.05, &strict, &finitum).unwrap();
+    assert!(rollback.passed, "{rollback:#?}");
+    assert!(
+        rollback
+            .validate(&after_one, &context, 0.05, &strict, &finitum)
+            .unwrap()
+            .accepted
+    );
+
+    let accepted_is_not_rollback_evidence =
+        check_rollback_identity(&after_one, &context, 0.05, &fixed, &finitum).unwrap();
+    assert!(!accepted_is_not_rollback_evidence.passed);
+    assert_eq!(
+        accepted_is_not_rollback_evidence.disposition,
+        krasis::AttemptDisposition::UnexpectedAccepted
+    );
+
+    let invalid_finite_config = BdfConfig {
+        minimum_step: 0.1,
+        maximum_step: 0.05,
+        ..fixed.clone()
+    };
+    let solver_error =
+        check_rollback_identity(&execution, &context, 0.05, &invalid_finite_config, &finitum)
+            .unwrap();
+    assert!(solver_error.passed, "{solver_error:#?}");
+    assert_eq!(
+        solver_error.disposition,
+        krasis::AttemptDisposition::SolverError
+    );
+
+    for nonfinite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let refusal =
+            check_rollback_identity(&execution, &context, nonfinite, &fixed, &finitum).unwrap_err();
+        assert_eq!(refusal.code, "KRASIS_VERIFY_NONFINITE_IDENTITY_INPUT");
+        let nonfinite_config = BdfConfig {
+            maximum_step: nonfinite,
+            ..fixed.clone()
+        };
+        let refusal =
+            check_rollback_identity(&execution, &context, 0.05, &nonfinite_config, &finitum)
+                .unwrap_err();
+        assert_eq!(refusal.code, "KRASIS_VERIFY_NONFINITE_IDENTITY_INPUT");
+    }
+    let refusal =
+        check_rollback_identity(&execution, &context, -0.0, &fixed, &finitum).unwrap_err();
+    assert_eq!(refusal.code, "KRASIS_VERIFY_NEGATIVE_ZERO_IDENTITY_INPUT");
+    let positive_zero =
+        check_rollback_identity(&execution, &context, 0.0, &fixed, &finitum).unwrap();
+    assert_ne!(
+        positive_zero.disposition,
+        krasis::AttemptDisposition::UnexpectedAccepted
+    );
+
+    let failed_finitum = finitum_verification(&execution, 1.0);
+    let failed_source_evidence =
+        check_rollback_identity(&execution, &context, 0.05, &strict, &failed_finitum).unwrap();
+    assert_eq!(
+        failed_source_evidence.binding.finitum_verification_accepted,
+        Some(false)
+    );
+    assert!(!failed_source_evidence.passed);
+
+    let (different_operator, different_state) =
+        coupled_fixture_variant("k=1+0.1u;direction=0.1du/v2", 0.1, 0.0);
+    let different_execution =
+        CoupledExecution::new(different_operator, different_state, &context).unwrap();
+    assert_eq!(
+        execution.operator().realization().mesh(),
+        different_execution.operator().realization().mesh()
+    );
+    let wrong_source = finitum_verification(&different_execution, 0.0);
+    let refusal =
+        check_rollback_identity(&execution, &context, 0.05, &strict, &wrong_source).unwrap_err();
+    assert_eq!(refusal.code, "KRASIS_VERIFY_FINITUM_SOURCE");
+
+    let mut negative_field = execution.clone();
+    let mut checkpoint = negative_field.checkpoint().unwrap();
+    checkpoint.state.fields.get_mut("u").unwrap()[0] = -0.0;
+    checkpoint.integrator.values[0] = -0.0;
+    negative_field.restore(&checkpoint).unwrap();
+    let refusal =
+        check_rollback_identity(&negative_field, &context, 0.05, &strict, &finitum).unwrap_err();
+    assert_eq!(refusal.code, "KRASIS_VERIFY_NEGATIVE_ZERO_IDENTITY_INPUT");
+
+    let mut positive_field = execution.clone();
+    let mut checkpoint = positive_field.checkpoint().unwrap();
+    checkpoint.state.fields.get_mut("u").unwrap()[0] = 0.0;
+    checkpoint.integrator.values[0] = 0.0;
+    positive_field.restore(&checkpoint).unwrap();
+    assert!(check_rollback_identity(&positive_field, &context, 0.05, &strict, &finitum).is_ok());
+
+    let mut negative_constitutive = execution.clone();
+    let mut checkpoint = negative_constitutive.checkpoint().unwrap();
+    checkpoint.state.constitutive.get_mut("material").unwrap()[0] = -0.0;
+    negative_constitutive.restore(&checkpoint).unwrap();
+    let refusal =
+        check_rollback_identity(&negative_constitutive, &context, 0.05, &strict, &finitum)
+            .unwrap_err();
+    assert_eq!(refusal.code, "KRASIS_VERIFY_NEGATIVE_ZERO_IDENTITY_INPUT");
+
+    let mut negative_history = execution.clone();
+    assert!(matches!(
+        negative_history
+            .attempt_step(&context, 0.05, &fixed)
+            .unwrap(),
+        StepOutcome::Accepted(_)
+    ));
+    let mut checkpoint = negative_history.checkpoint().unwrap();
+    checkpoint.state.field_history.get_mut("u").unwrap()[0][0] = -0.0;
+    checkpoint.integrator.previous_values.as_mut().unwrap()[0] = -0.0;
+    negative_history.restore(&checkpoint).unwrap();
+    let refusal =
+        check_rollback_identity(&negative_history, &context, 0.05, &strict, &finitum).unwrap_err();
+    assert_eq!(refusal.code, "KRASIS_VERIFY_NEGATIVE_ZERO_IDENTITY_INPUT");
+}
+
+#[test]
+fn sv0_restart_and_history_refuse_invalid_sequences() {
+    let context = EvaluationContext::reproducible();
+    let (operator, state) = coupled_fixture();
+    let execution = CoupledExecution::new(operator, state, &context).unwrap();
+    let fixed = fixed_config(0.05);
+    let finitum = finitum_verification(&execution, 0.0);
+    assert!(check_restart_trajectory(&execution, &context, 0.05, 2, 0, &fixed, &finitum).is_err());
+    assert!(
+        check_history_and_rejection(&execution, &context, 0.05, 0, &fixed, &fixed, &finitum,)
+            .is_err()
+    );
+}
+
+fn finitum_verification(
+    execution: &CoupledExecution,
+    candidate_offset: f64,
+) -> FinitumVerificationSource {
+    let mesh = execution.operator().realization().mesh();
+    let nodal_values = mesh
+        .vertices()
+        .iter()
+        .map(|coordinates| coordinates.iter().sum::<f64>() + candidate_offset)
+        .collect::<Vec<_>>();
+    FinitumVerificationSource::check_patch(
+        execution.operator().realization(),
+        1,
+        &nodal_values,
+        ComparisonTolerance {
+            absolute: 1.0e-11,
+            relative: 1.0e-11,
+        },
+        |coordinates| vec![coordinates.iter().sum()],
+    )
+    .unwrap()
+}
+
+fn rehash_restart(report: &mut krasis::RestartTrajectoryReport) {
+    report.report_digest.clear();
+    report.report_digest = format!(
+        "blake3:{}",
+        blake3::hash(&serde_json::to_vec(report).unwrap()).to_hex()
+    );
 }
 
 fn coupled_fixture() -> (CoupledOperator, SimulationState) {

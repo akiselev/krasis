@@ -1,7 +1,7 @@
 # Krasis status
 
 Updated: 2026-08-21
-Milestone: R1 Scientia consumer migration
+Milestone: SV0-B4 reusable coupled verification
 
 ## Implemented
 
@@ -22,19 +22,37 @@ Milestone: R1 Scientia consumer migration
 - `CrossDialectOperator` composes distinct Finitum `DiscreteOperator` families with explicit,
   finite, bidirectional off-diagonal matrices; it implements Methodus DAE, nonlinear, and block
   contracts and rejects same-family or one-way placeholder configurations.
+- serializable SV0-B4 reports/refusals for byte-exact rollback, checkpoint/restart trajectory
+  identity, isolated cross-block derivatives, counted block-strategy agreement and work budgets,
+  bounded-history synchronization, and event-state disposition;
+- every SV0-B4 report binds operator, state/block-layout, and checker-configuration identities;
+  the identity includes the complete Methodus evaluation context, and every versioned report has
+  a canonical digest plus a source-aware recomputation validator;
+- coupled-execution reports additionally bind a compatible Finitum-owned realization-agreement or
+  nodal-patch report to the exact realization identity, recompute it against that realization or
+  mesh, and retain its typed header and acceptance;
+- event evidence is currently scoped to a caller-supplied Methodus `DaeOperator`; Krasis does not
+  yet claim `CoupledExecution` event-record persistence.
+- identity-bearing floating-point inputs refuse NaN, either infinity, and negative zero before
+  serialization; positive zero is canonical, and solver-error disposition uses finite invalid
+  policy rather than a nonfinite sentinel.
+- coupled source validation recursively covers checkpoint fields/history/constitutive state,
+  Methodus integrator history, and exposed Finitum mesh/element/constraint/stored-input values
+  before any checkpoint or report identity is hashed.
 
 ## Boundary
 
 Scientia owns scientific/coupling meaning, Finitum owns concrete discrete operators,
 Krasis owns stateful composition, and Methodus owns the algorithms acting on it.
 
-The numerical dependency moved directly from Solverang to Methodus at Methodus
-`d5354abb4dfd197ba5fd66f3742f9820701e4c43`; Krasis has no dependency on the
+The numerical dependency moved directly from Solverang to Methodus; SV0-B4 is validated against
+Methodus `b1b10c9f9ff682e562408c5080ad408a9c37a594`. Krasis has no dependency on the
 generalized Solverang constraint engine.
 
 The cross-dialect and serialized-checkpoint contracts were validated against Scientia
-`215433962c874dfd86b59ffc6d69f017bba2b95a` and Finitum
-`bbc242af14672229294dfb80e48941ba9e6b1ee6`.
+`0f8d7d65f78d9215385f4912ba79c1be1d979d70`, Finitum SV0-B3
+`13f14c0427d3b839e777e9f57086f37ef558592b`, and Resolvent
+`5e106e780e44926f8236288d2f76e48dc0283aa9`.
 
 ## Validation
 
@@ -44,13 +62,13 @@ Passed on 2026-08-21 with Rust 1.97.0:
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 12 passed, 0 failed
+cargo test --locked --workspace --all-targets           # 20 passed, 0 failed
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
-cargo test --locked --workspace --doc
+RUSTDOCFLAGS='-D warnings' cargo test --locked --workspace --doc
 git diff --check
 ```
 
 ## Next
 
-Extend coupling effects or transactional state only from a concrete product case; preserve the
-validated checkpoint identity and atomic restore contract.
+Let Sinbad SV0-B5 dispatch these owning checkers and retain their typed reports. Add coupled event
+persistence only from a concrete product case.
