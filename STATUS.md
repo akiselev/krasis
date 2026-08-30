@@ -1,6 +1,6 @@
 # Krasis status
 
-Updated: 2026-08-21
+Updated: 2026-08-30
 Milestone: SV0-B4 reusable coupled verification
 
 ## Implemented
@@ -68,7 +68,20 @@ RUSTDOCFLAGS='-D warnings' cargo test --locked --workspace --doc
 git diff --check
 ```
 
+## Known limits recorded by the 2026-08-30 workspace audit (tree `bb2abe4`)
+
+- There is no initial-condition concept: an IC is a caller-assembled
+  `Vec<f64>` passed to `insert_field`, with no spatial evaluator or
+  projection onto the DOF map.
+- State blocks bind to Finitum realizations by `BlockId` name and position,
+  not by Scientia `SymbolId`.
+- `make_initial_state_consistent` is the default no-op; no DAE consistent
+  initialization is performed. `CoupledExecution` does not persist events.
+
 ## Next
 
-Let Sinbad SV0-B5 dispatch these owning checkers and retain their typed reports. Add coupled event
-persistence only from a concrete product case.
+GX-D1 (see `sinbad/docs/simulation-vision/GX-GENERIC-EXECUTION-PLANE.md`):
+initial-condition projection from a Finitum `FieldSource` onto the DOF map,
+`SymbolId`-linked state blocks, and index-1 consistent initialization where the
+Scientia structural plan requires it. This waits for Finitum GX-C3. Coupled
+event persistence still lands only from a concrete product case.
