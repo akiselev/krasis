@@ -1,11 +1,34 @@
+use std::collections::BTreeSet;
+
 use finitum::RealizationPlan;
 use methodus::{
     BdfConfig, BdfState, BlockLayout as SolverBlockLayout, BlockNonlinearOperator, BlockSpec,
-    DaeOperator, EvaluationContext, NonlinearOperator, NumericError, StepOutcome, bdf_step,
+    DaeOperator, EvaluationContext, NewtonConfig, NonlinearOperator, NumericError, StepOutcome,
+    bdf_step, solve_newton,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{Checkpoint, KrasisError, SimulationState, StateLayout, TransactionPhase};
+use crate::{
+    BlockId, Checkpoint, KrasisError, SimulationState, StateBinding, StateLayout, TransactionPhase,
+};
+
+/// Per-row classification for index-1 consistent initialization.
+///
+/// `Differential` rows contribute their state-rate to the unknown solved by
+/// [`CoupledOperator::solve_consistent_state_rate`]. `Algebraic` rows contribute no rate
+/// unknown; that row's residual must already vanish at the supplied state (see
+/// [`CoupledOperator::solve_consistent_state_rate`] for the exact refusal condition).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RowKind {
+    Differential,
+    Algebraic,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ConsistentInitialization {
+    mask: Vec<RowKind>,
+    newton: NewtonConfig,
+}
 
 /// Krasis-owned composition of a realized Finitum action into Methodus contracts.
 ///
@@ -16,6 +39,8 @@ pub struct CoupledOperator {
     realization: RealizationPlan,
     state_layout_identity: String,
     block_layout: SolverBlockLayout,
+    state_binding: Option<StateBinding>,
+    consistent_initialization: Option<ConsistentInitialization>,
     identity: String,
 }
 
@@ -24,12 +49,34 @@ impl CoupledOperator {
         realization: RealizationPlan,
         state_layout: &StateLayout,
     ) -> Result<Self, KrasisError> {
+        Self::new_with_bindings(realization, state_layout, None)
+    }
+
+    /// Additive constructor that records a [`StateBinding`] in the operator identity.
+    ///
+    /// `state_binding`, when present, must name exactly the blocks in `state_layout`.
+    pub fn new_with_bindings(
+        realization: RealizationPlan,
+        state_layout: &StateLayout,
+        state_binding: Option<StateBinding>,
+    ) -> Result<Self, KrasisError> {
         if realization.dimension() != state_layout.width() {
             return Err(KrasisError::InvalidCoupling(format!(
                 "Finitum dimension {} differs from Krasis state width {}",
                 realization.dimension(),
                 state_layout.width()
             )));
+        }
+        if let Some(binding) = &state_binding {
+            let layout_blocks: BTreeSet<BlockId> = state_layout
+                .blocks()
+                .iter()
+                .map(|block| block.id().clone())
+                .collect();
+            let binding_blocks: BTreeSet<BlockId> = binding.blocks().cloned().collect();
+            if layout_blocks != binding_blocks {
+                return Err(KrasisError::StateBindingLayoutMismatch);
+            }
         }
         let block_layout = SolverBlockLayout::new(
             state_layout
@@ -44,14 +91,24 @@ impl CoupledOperator {
         )
         .map_err(|error| KrasisError::InvalidCoupling(error.to_string()))?;
         let state_layout_identity = state_layout.identity().to_owned();
-        let identity = format!(
-            "krasis-coupled/1:realization={}:state-layout={state_layout_identity}",
-            realization.digest()
-        );
+        let identity = if let Some(binding) = &state_binding {
+            format!(
+                "krasis-coupled/2:realization={}:state-layout={state_layout_identity}:state-binding={}",
+                realization.digest(),
+                binding.identity()
+            )
+        } else {
+            format!(
+                "krasis-coupled/1:realization={}:state-layout={state_layout_identity}",
+                realization.digest()
+            )
+        };
         Ok(Self {
             realization,
             state_layout_identity,
             block_layout,
+            state_binding,
+            consistent_initialization: None,
             identity,
         })
     }
@@ -68,11 +125,236 @@ impl CoupledOperator {
         self.realization.dimension()
     }
 
+    pub fn state_binding(&self) -> Option<&StateBinding> {
+        self.state_binding.as_ref()
+    }
+
+    /// Additively record a per-row differential/algebraic mask and Newton policy for index-1
+    /// consistent initialization, folding both into the operator identity.
+    ///
+    /// Without this, [`DaeOperator::make_initial_state_consistent`] stays the inherited no-op,
+    /// identical to today's behavior.
+    pub fn with_consistent_initialization(
+        mut self,
+        mask: Vec<RowKind>,
+        newton: NewtonConfig,
+    ) -> Result<Self, KrasisError> {
+        if mask.len() != self.dimension() {
+            return Err(KrasisError::ConsistentInitializationMaskLength {
+                actual: mask.len(),
+                expected: self.dimension(),
+            });
+        }
+        self.identity = format!(
+            "{}:consistent-init={}",
+            self.identity,
+            consistent_initialization_identity(&mask, &newton)
+        );
+        self.consistent_initialization = Some(ConsistentInitialization { mask, newton });
+        Ok(self)
+    }
+
+    /// Solve `F(time, state, ydot) = 0` for `ydot` given a fixed `state`, restricted to rows the
+    /// recorded mask marks `Differential`, via dense Newton over an operator wrapper whose
+    /// unknown is the reduced state rate.
+    ///
+    /// An `Algebraic` row never contributes a rate unknown (a semi-explicit index-1 DAE's
+    /// algebraic equations do not depend on `ydot`); its returned rate is `0.0`, and this
+    /// refuses unless that row's residual already vanishes (within the recorded Newton
+    /// configuration's absolute tolerance) at `state` — an inconsistent initial condition on an
+    /// algebraic row cannot be repaired by any choice of differential state rate. Requires a
+    /// mask recorded by [`Self::with_consistent_initialization`].
+    pub fn solve_consistent_state_rate(
+        &self,
+        context: &EvaluationContext,
+        time: f64,
+        state: &[f64],
+    ) -> Result<Vec<f64>, KrasisError> {
+        let config = self.consistent_initialization.as_ref().ok_or_else(|| {
+            KrasisError::InvalidCoupling(
+                "operator has no differential/algebraic mask for consistent initialization".into(),
+            )
+        })?;
+        if state.len() != self.dimension() {
+            return Err(KrasisError::InvalidCoupling(format!(
+                "state length {} differs from operator dimension {}",
+                state.len(),
+                self.dimension()
+            )));
+        }
+        if !time.is_finite() {
+            return Err(KrasisError::InvalidCoupling(
+                "consistent initialization time must be finite".into(),
+            ));
+        }
+        if state.iter().any(|value| !value.is_finite()) {
+            return Err(KrasisError::InvalidCoupling(
+                "consistent initialization state must be finite".into(),
+            ));
+        }
+
+        // The unknown is the state rate restricted to differential rows; an algebraic row
+        // never contributes a rate unknown (its residual is defined not to depend on `ydot`,
+        // matching a semi-explicit index-1 DAE), so its rate is fixed at zero while solving.
+        let differential_rows: Vec<usize> = config
+            .mask
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| matches!(row, RowKind::Differential))
+            .map(|(index, _)| index)
+            .collect();
+        let algebraic_rows: Vec<usize> = config
+            .mask
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| matches!(row, RowKind::Algebraic))
+            .map(|(index, _)| index)
+            .collect();
+
+        struct ReducedRateOperator<'a> {
+            operator: &'a CoupledOperator,
+            time: f64,
+            differential_state: &'a [f64],
+            differential_rows: &'a [usize],
+        }
+
+        impl ReducedRateOperator<'_> {
+            fn expand(&self, reduced: &[f64]) -> Vec<f64> {
+                let mut full = vec![0.0; self.operator.dimension()];
+                for (local, &global) in self.differential_rows.iter().enumerate() {
+                    full[global] = reduced[local];
+                }
+                full
+            }
+
+            fn restrict(&self, full: &[f64], output: &mut [f64]) {
+                for (local, &global) in self.differential_rows.iter().enumerate() {
+                    output[local] = full[global];
+                }
+            }
+        }
+
+        impl NonlinearOperator for ReducedRateOperator<'_> {
+            fn dimension(&self) -> usize {
+                self.differential_rows.len()
+            }
+
+            fn residual(
+                &self,
+                context: &EvaluationContext,
+                state_rate: &[f64],
+                output: &mut [f64],
+            ) -> Result<(), NumericError> {
+                let full_rate = self.expand(state_rate);
+                let mut full_output = vec![0.0; self.operator.dimension()];
+                DaeOperator::residual(
+                    self.operator,
+                    context,
+                    self.time,
+                    self.differential_state,
+                    &full_rate,
+                    &mut full_output,
+                )?;
+                self.restrict(&full_output, output);
+                Ok(())
+            }
+
+            fn jacobian_vector_product(
+                &self,
+                context: &EvaluationContext,
+                state_rate: &[f64],
+                direction: &[f64],
+                output: &mut [f64],
+            ) -> Result<(), NumericError> {
+                let full_rate = self.expand(state_rate);
+                let full_rate_direction = self.expand(direction);
+                let zero_state_direction = vec![0.0; self.operator.dimension()];
+                let mut full_output = vec![0.0; self.operator.dimension()];
+                DaeOperator::jacobian_vector_product(
+                    self.operator,
+                    context,
+                    self.time,
+                    self.differential_state,
+                    &full_rate,
+                    &zero_state_direction,
+                    &full_rate_direction,
+                    &mut full_output,
+                )?;
+                self.restrict(&full_output, output);
+                Ok(())
+            }
+        }
+
+        let wrapper = ReducedRateOperator {
+            operator: self,
+            time,
+            differential_state: state,
+            differential_rows: &differential_rows,
+        };
+        let initial_guess = vec![0.0; differential_rows.len()];
+        let report = solve_newton(&wrapper, context, &initial_guess, &config.newton)
+            .map_err(|error| KrasisError::Solve(error.to_string()))?;
+        if !report.converged {
+            return Err(KrasisError::Solve(
+                "consistent initialization Newton solve did not converge".into(),
+            ));
+        }
+        if report.state.iter().any(|value| !value.is_finite()) {
+            return Err(KrasisError::Solve(
+                "consistent state rate solve produced non-finite values".into(),
+            ));
+        }
+
+        let mut state_rate = vec![0.0; self.dimension()];
+        for (local, &global) in differential_rows.iter().enumerate() {
+            state_rate[global] = report.state[local];
+        }
+
+        // An algebraic row's residual never depends on `ydot`, so it must already vanish at
+        // `state`; a nonzero residual there means the supplied initial condition is not
+        // consistent with the algebraic constraint, and no choice of differential state rate
+        // can fix it.
+        if !algebraic_rows.is_empty() {
+            let mut residual = vec![0.0; self.dimension()];
+            DaeOperator::residual(self, context, time, state, &state_rate, &mut residual)
+                .map_err(|error| KrasisError::Solve(error.to_string()))?;
+            for &row in &algebraic_rows {
+                if residual[row].abs() > config.newton.absolute_tolerance {
+                    return Err(KrasisError::InvalidCoupling(format!(
+                        "row {row} is marked algebraic but has residual {} at the supplied \
+                         initial state, which exceeds the configured absolute tolerance {}; the \
+                         initial condition is not consistent with the algebraic constraint",
+                        residual[row], config.newton.absolute_tolerance
+                    )));
+                }
+            }
+        }
+
+        Ok(state_rate)
+    }
+
     fn numeric_error(error: finitum::FinitumError) -> NumericError {
         NumericError::Operator {
             message: error.to_string(),
         }
     }
+}
+
+fn consistent_initialization_identity(mask: &[RowKind], newton: &NewtonConfig) -> String {
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        schema: &'static str,
+        mask: &'a [RowKind],
+        newton: &'a NewtonConfig,
+    }
+
+    let bytes = serde_json::to_vec(&Payload {
+        schema: "krasis-consistent-init/1",
+        mask,
+        newton,
+    })
+    .expect("consistent-initialization identity payload is serializable");
+    format!("blake3:{}", blake3::hash(&bytes).to_hex())
 }
 
 impl NonlinearOperator for CoupledOperator {
@@ -151,6 +433,26 @@ impl DaeOperator for CoupledOperator {
                 output,
             )
             .map_err(Self::numeric_error)
+    }
+
+    fn make_initial_state_consistent(
+        &self,
+        context: &EvaluationContext,
+        time: f64,
+        state: &mut [f64],
+    ) -> Result<(), NumericError> {
+        if self.consistent_initialization.is_none() {
+            // No mask was recorded at construction: identical to the inherited no-op.
+            return Ok(());
+        }
+        // This never adjusts `state`, only the (discarded) state rate; it exists to validate
+        // that a consistent state rate exists at `time`, refusing early rather than at the
+        // first BDF step.
+        self.solve_consistent_state_rate(context, time, state)
+            .map(|_| ())
+            .map_err(|error| NumericError::Operator {
+                message: error.to_string(),
+            })
     }
 }
 

@@ -1,18 +1,22 @@
 //! Coupled field state and transactional simulation runtime.
 
+mod binding;
 mod checkpoint;
 mod coupled;
 mod error;
 mod event;
+mod initial;
 mod layout;
 mod method;
 mod state;
 mod verification;
 
+pub use binding::{SemanticId, StateBinding};
 pub use checkpoint::Checkpoint;
-pub use coupled::{CoupledCheckpoint, CoupledExecution, CoupledOperator};
+pub use coupled::{CoupledCheckpoint, CoupledExecution, CoupledOperator, RowKind};
 pub use error::KrasisError;
 pub use event::{EventDirection, EventRecord};
+pub use initial::{NodalContext, initial_state_from};
 pub use layout::{BlockId, StateBlock, StateLayout};
 pub use method::CrossDialectOperator;
 pub use state::{ConstitutiveSlot, FieldId, SimulationState, TransactionPhase};

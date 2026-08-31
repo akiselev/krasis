@@ -54,4 +54,44 @@ pub enum KrasisError {
     InvalidCoupling(String),
     #[error("coupled numerical solve failed: {0}")]
     Solve(String),
+    #[error("nodal context has no vertex coordinates")]
+    EmptyNodalContext,
+    #[error(
+        "nodal coordinate {index} has dimension {actual}, expected {expected} to match every other vertex"
+    )]
+    InconsistentNodalCoordinates {
+        index: usize,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("initial-condition bindings are missing block `{0}`")]
+    InitialBlockMissing(String),
+    #[error("initial-condition bindings name unknown block `{0}`")]
+    InitialBlockUnknown(String),
+    #[error("initial-condition bindings name block `{0}` more than once")]
+    InitialBlockDuplicate(String),
+    #[error(
+        "block `{block}` has width {width}, which is not a whole number of components over {vertex_count} vertices"
+    )]
+    InitialDimensionMismatch {
+        block: String,
+        width: usize,
+        vertex_count: usize,
+    },
+    #[error("block `{0}` binds a field source that cannot be evaluated pointwise")]
+    InitialSourceNotPointwise(String),
+    #[error("state binding names unknown block `{0}`")]
+    StateBindingUnknownBlock(String),
+    #[error("state binding names block `{0}` more than once")]
+    StateBindingDuplicateBlock(String),
+    #[error("state binding names semantic id `{0}` more than once")]
+    StateBindingDuplicateSemanticId(u32),
+    #[error("state binding does not cover every block in the state layout")]
+    StateBindingIncomplete,
+    #[error("state binding blocks do not match the coupled operator's state layout")]
+    StateBindingLayoutMismatch,
+    #[error(
+        "consistent-initialization mask has {actual} rows, expected {expected} to match the operator dimension"
+    )]
+    ConsistentInitializationMaskLength { actual: usize, expected: usize },
 }
