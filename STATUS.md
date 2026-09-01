@@ -1,7 +1,8 @@
 # Krasis status
 
-Updated: 2026-08-30
-Milestone: SV0-B4 reusable coupled verification
+Updated: 2026-09-01
+Milestone: SV0-B4 reusable coupled verification + GX-D1 initial-condition
+projection + E6 transactional block-linear composition
 
 ## Implemented
 
@@ -39,6 +40,18 @@ Milestone: SV0-B4 reusable coupled verification
 - coupled source validation recursively covers checkpoint fields/history/constitutive state,
   Methodus integrator history, and exposed Finitum mesh/element/constraint/stored-input values
   before any checkpoint or report identity is hashed.
+- GX-D1 (`e4478f5`): initial-condition projection from Finitum `FieldSource`s onto the DOF map,
+  `SymbolId`-linked state blocks (`StateBinding`/`NodalContext`), and reduced-row consistent
+  initialization; the authoritative record is `sinbad/docs/simulation-vision/GX-CONTRACTS.md`
+  C11.8.
+- E6 block-linear composition (`91dfd25`): `block_state_layout` adapts a Finitum product-space
+  `BlockLayout` into `StateLayout`/`StateBinding` (the GX-D1 `SymbolId` convention generalized to
+  N block-composed fields, no scientia dependency); `BlockLinearExecution`/`BlockLinearCheckpoint`
+  drive `methodus::solve_minres` inside the existing trial/commit/rollback transaction — only a
+  converged solve ever commits; typed refusals for dimension/block/length mismatches and
+  cross-operator checkpoint restores; six acceptance tests compose finitum's real
+  vector-P2/scalar-P1 `MixedOperator` saddle-point fixture with rollback/restart/history
+  evidence (40 tests total at that head).
 
 ## Boundary
 
@@ -70,6 +83,10 @@ git diff --check
 
 ## Known limits recorded by the 2026-08-30 workspace audit (tree `bb2abe4`)
 
+The first two bullets describe the pre-GX-D1 state and are superseded by
+`e4478f5` (C11.8); the third's consistent-initialization half is superseded
+(reduced-row initialization landed), while event persistence remains open.
+
 - There is no initial-condition concept: an IC is a caller-assembled
   `Vec<f64>` passed to `insert_field`, with no spatial evaluator or
   projection onto the DOF map.
@@ -80,8 +97,14 @@ git diff --check
 
 ## Next
 
-GX-D1 (see `sinbad/docs/simulation-vision/GX-GENERIC-EXECUTION-PLANE.md`):
-initial-condition projection from a Finitum `FieldSource` onto the DOF map,
-`SymbolId`-linked state blocks, and index-1 consistent initialization where the
-Scientia structural plan requires it. This waits for Finitum GX-C3. Coupled
-event persistence still lands only from a concrete product case.
+GX-D1 and the E6 block-linear composition are landed (`e4478f5`, `91dfd25`).
+Demand-pulled next work (workspace `PLAN.md` §6):
+
+1. fold `finitum::MixedOperator::digest()` (finitum `96edb6d`) into
+   `BlockLinearCheckpoint`'s operator identity — content-addressed instead of
+   shape-only — once Krasis binds a `MixedOperator` concretely;
+2. block composition over the executable `SystemRealizationPlan` operators
+   (finitum `739e2aa`+) as coupled/transient Stokes and the E7 trajectory
+   adjoints demand it;
+3. DAE index-1 consistent initialization beyond reduced-row, and coupled
+   event persistence — still only from a concrete product case.
