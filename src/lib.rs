@@ -1,6 +1,8 @@
 //! Coupled field state and transactional simulation runtime.
 
 mod binding;
+mod block_binding;
+mod block_solve;
 mod checkpoint;
 mod coupled;
 mod error;
@@ -12,6 +14,8 @@ mod state;
 mod verification;
 
 pub use binding::{SemanticId, StateBinding};
+pub use block_binding::block_state_layout;
+pub use block_solve::{BlockLinearCheckpoint, BlockLinearExecution};
 pub use checkpoint::Checkpoint;
 pub use coupled::{CoupledCheckpoint, CoupledExecution, CoupledOperator, RowKind};
 pub use error::KrasisError;
