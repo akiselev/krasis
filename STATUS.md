@@ -2,8 +2,9 @@
 
 Updated: 2026-09-01
 Milestone: SV0-B4 reusable coupled verification + GX-D1 initial-condition
-projection + E6 transactional block-linear composition + W7 SC-W1 steady-runner
-target (`BlockLinearExecution` content-addressed, CG/MINRES/GMRES)
+projection + E6 transactional block-linear composition + W7 batch P / SC-W1
+(`CoupledSystemOperator` N-leaf DAE composition with Newton inside BDF, the SV7-F2
+coupling graph, content-addressed `BlockLinearExecution` steady-runner target)
 
 ## Implemented
 
@@ -21,9 +22,11 @@ target (`BlockLinearExecution` content-addressed, CG/MINRES/GMRES)
   values, step-size history, time, and accepted-step identity;
 - checkpoint operator identities incorporating Finitum's concrete plan digest and the Krasis
   state layout, with same-size geometry and dynamic-material mismatch refusals.
-- `CrossDialectOperator` composes distinct Finitum `DiscreteOperator` families with explicit,
-  finite, bidirectional off-diagonal matrices; it implements Methodus DAE, nonlinear, and block
-  contracts and rejects same-family or one-way placeholder configurations.
+- ~~`CrossDialectOperator`~~ retired in W7: `CoupledSystemOperator` covers its FC10 test
+  (`tests/coupled_system.rs`, `fc10_*`: the same residual values, JVP check, canonical identity
+  over the cross matrices, and Methodus BDF advance). Its two refusals -- same family, one-way
+  coupling -- are deliberately dropped: two leaves of one family across plans and one-way (DAG)
+  coupling are both legitimate compositions now, and the graph reports them.
 - serializable SV0-B4 reports/refusals for byte-exact rollback, checkpoint/restart trajectory
   identity, isolated cross-block derivatives, counted block-strategy agreement and work budgets,
   bounded-history synchronization, and event-state disposition;
@@ -69,6 +72,35 @@ target (`BlockLinearExecution` content-addressed, CG/MINRES/GMRES)
   pressure nullspace -> `load_vector`) and proves the Krasis-transacted MINRES and GMRES
   solutions and traces are **bit-identical** to the direct Methodus calls (46 tests at this
   head).
+- W7 batch P + SC-W1 skeleton (this commit): `CoupledSystemOperator` composes N `CoupledLeaf`s
+  (each any `methodus::DaeOperator` -- a Finitum realization through `CoupledOperator`, a
+  Finitum `DiscreteOperator`, later Finitum's state-dependent `SystemOperator` -- with its own
+  `StateLayout`, a `StateBinding` to system-level `SemanticId`s, an opaque content identity and
+  optional differential/algebraic row kinds) with `CouplingEdge`s (a `methodus::LinearOperator`
+  from one leaf's `State` or `Rate` into another leaf's residual, plus an opaque relation
+  identity; `CouplingEdge::matrix` derives it from a `CsrMatrix`'s content). The composed
+  operator implements `DaeOperator` (leaf residuals/JVPs plus edge actions on sub-slices;
+  events concatenated), `NonlinearOperator` (steady view `t = 0`, `ydot = 0`) and
+  `BlockNonlinearOperator` (one Methodus block per leaf, so `solve_blocks` partitions by
+  realization group); `with_consistent_initialization(newton)` composes the leaves' row kinds
+  into one mask solved over the composed residual (cross edges take part); identity
+  `krasis-coupled-system/1` is canonical over leaf names/identities/layouts/bindings/masks and
+  sorted edges. `CouplingGraph` (SV7-F2) exposes nodes, typed dependencies and Tarjan SCC
+  stages in dependencies-first order (`is_acyclic`). `CoupledExecution<Op = CoupledOperator>`
+  is now generic over a `TransactionalOperator` (`CoupledOperator`, `CoupledSystemOperator`),
+  so Newton-inside-BDF (`methodus::bdf_step`), checkpoints binding Krasis state to Methodus BDF
+  history, restore refusals and rollback of failed steps are the same code for one realization
+  and for an N-leaf composition; `CoupledOperator` gains `state_layout_identity()` and
+  `row_kinds()`, and the consistent-rate solve is one shared function. `SemanticId` now
+  documents the `SysVarId` meaning (C11.8 as amended by C12); `CoupledSystemOperator` refuses a
+  semantic id or block id shared by two leaves. `tests/coupled_system.rs` (12 tests):
+  composed residual = leaf residuals + edge actions and `verify_dae_jvp`; BDF1/BDF2 through the
+  transaction reproduce a manufactured solution with measured halving ratios 2 and 4; bitwise
+  checkpoint/restart replay plus cross-identity and failed-Newton rollback refusals; consistent
+  initialization over the composed residual; monolithic Newton vs Gauss-Seidel vs Jacobi
+  agreement (and the SV0-B4 `check_strategy_work` report) on a nontrivial two-mesh Dirichlet
+  diffusion pair; graph stages for DAG/cycle/mixed shapes and a one-sweep exactness check of the
+  schedule; refusals; canonical identity; the FC10 port. 54 tests at this head.
 
 ## Boundary
 
@@ -104,7 +136,7 @@ path dependencies (sibling repositories), so this wave formats Krasis alone:
 ```text
 cargo fmt -p krasis -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test                                              # 46 passed, 0 failed (SC-W1 commit)
+cargo test                                              # 46 passed (SC-W1 commit); 54 passed (batch P commit)
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
 ```
 
@@ -124,35 +156,41 @@ The first two bullets describe the pre-GX-D1 state and are superseded by
 
 ## Next
 
-GX-D1 and the E6 block-linear composition are landed (`e4478f5`, `91dfd25`).
-Demand-pulled next work (workspace `PLAN.md` §6):
+W7 landed (this head): the content-addressed `BlockLinearExecution` steady-runner target
+(SC-W1, Krasis side), `CoupledSystemOperator` with the coupling graph and Newton inside BDF
+(batch P item 3 / SV1-F1, SV7-F2, SV4-H1 skeleton), `CrossDialectOperator` retired,
+`SemanticId` = `SysVarId` convention. Honestly open, with what each waits on:
 
-1. ~~fold `finitum::MixedOperator::digest()` into `BlockLinearCheckpoint`'s
-   operator identity~~ — landed in W7 (`OperatorIdentity`, `krasis-block-linear/2`);
-2. block composition over the executable `SystemRealizationPlan` operators
-   (finitum `739e2aa`+) as coupled/transient Stokes and the E7 trajectory
-   adjoints demand it;
-3. DAE index-1 consistent initialization beyond reduced-row, and coupled
-   event persistence — still only from a concrete product case.
-4. SC composition (design `sinbad/ARCHITECTURE.md` §8, §12; nothing landed).
-   `SemanticId` keeps its `u32` type and comes to mirror Scientia's system-level
-   `SysVarId` (a one-line C11.8 amendment). Prerequisite batch P: N-block DAE
-   composition over `SystemRealizationPlan` with Newton inside BDF, so 08 can
-   execute monolithically. SC-W1: `CoupledSystemOperator` implementing
-   `NonlinearOperator`/`DaeOperator`/`BlockNonlinearOperator` over Finitum leaf
-   actions and connection realizations (this is SV1-F1 / SV7-F2 / SV4-H1 — the
-   IDs are kept), plus the separately gated reroute of Sinbad's steady system
-   runner through `BlockLinearExecution` (25-stokes and 13-mixed-darcy must
-   reproduce today's solutions within 1e-12 relative before the old path goes).
-   The Krasis side of the reroute is landed (W7): Sinbad builds the reduced
-   operator exactly as today, then `block_state_layout(reduced.operator()
-   .layout())`, `SimulationState::zeroed(layout, history)`,
-   `BlockLinearExecution::new(&reduced, state)`, and `solve(ctx, &rhs, None,
-   projector, &BlockLinearSolver::Minres(cfg), 0.0)`; the report's `report` is
-   the unchanged Methodus `LinearSolveReport`, `restart_cycles` the GMRES
-   count, `algorithm.label()` the receipt string. The bitwise agreement on
-   25-stokes is proven in `tests/sc_w1_steady_reroute.rs`; 13-mixed-darcy goes
-   through the same call with `bind_kernels_with_facets` and is Sinbad's gate.
-   `CrossDialectOperator` is retired once `CoupledSystemOperator` covers its FC10
-   test. Partitioned-iteration state and output-based convergence evaluation live
-   in the fixed-point transaction (SC-W3).
+1. **Transient composition over `SystemRealizationPlan`.** Finitum's `SystemOperator` is
+   still globally linear and rate-free (`residual(state)` = `A * state`, no time, no
+   `state_rate`); the state-dependent, rate-capable residual/JVP is the Finitum lane's batch P
+   item 2. Once it lands with the `RealizationPlan` shape (`residual(time, state, state_rate,
+   output)`, `jacobian_vector_product(time, state, state_rate, state_direction, rate_direction,
+   output)`, `digest()`, `layout()`), a Krasis `CoupledOperator`-style leaf over it is the only
+   missing piece and 08 executes monolithically through `CoupledExecution<CoupledSystemOperator>`.
+   Today a `ReducedSystemOperator` enters Krasis only through `BlockLinearExecution` (steady).
+2. **Newton-Krylov inside BDF.** Methodus has no Newton-Krylov committed; `bdf_step` runs its
+   dense `solve_newton`. Krasis deliberately does not carry a Newton loop of its own (AGENTS.md:
+   no numerical algorithms in Krasis). Needed from Methodus: `bdf_step` accepting a nonlinear
+   driver other than dense Newton (`NonlinearStrategy { DenseNewton | NewtonKrylov | Blocks }`
+   on `BdfConfig`, or a `bdf_step_with` variant) and `solve_newton_krylov` over the JVP action
+   with GMRES; `BdfState`/`StepOutcome` unchanged so Krasis checkpoints keep their shape. With
+   that, partitioned iteration runs inside a BDF step through the same `CoupledExecution`.
+3. **Fixed-point transaction (SC-W3).** The coupling graph and the per-leaf block layout are
+   the inputs; partitioned-iteration state, output-based convergence evaluation and
+   acceleration wait on Methodus's acceleration hooks (SV7-F3) and on item 2. Not started.
+4. **Steady runner reroute in Sinbad (SC-W1 gate).** Krasis side landed; the 25-stokes bitwise
+   agreement is proven here (`tests/sc_w1_steady_reroute.rs`); 13-mixed-darcy goes through the
+   identical call with `bind_kernels_with_facets` and is Sinbad's gate. API for Sinbad:
+   `block_state_layout(reduced.operator().layout())`, `SimulationState::zeroed(layout, history)`,
+   `BlockLinearExecution::new(&reduced, state)`, `solve(ctx, &rhs, None, projector,
+   &BlockLinearSolver::{ConjugateGradient|Minres|Gmres}(cfg), 0.0)` returning
+   `BlockLinearReport { algorithm, report, restart_cycles }` (non-convergence:
+   `KrasisError::SolveDidNotConverge { algorithm, iterations }` after rollback).
+5. **Upstream (Finitum, still open, C11.8):** the P1 single-point quadrature makes the
+   consistent mass matrix rank-deficient; a pure reaction leaf's BDF Newton system is singular
+   on its own. The transient composition fixtures therefore use Finitum's network DAE
+   realization; the finite-element leaves are exercised on the steady view.
+6. DAE index-1 consistent initialization beyond reduced-row, and coupled event persistence --
+   still only from a concrete product case. `CoupledSystemOperator` concatenates leaf events
+   (`event_count`/`event_values`) but `CoupledExecution` still does not persist event records.

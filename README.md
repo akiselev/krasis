@@ -7,9 +7,16 @@ DAE implementations. `CoupledExecution` encloses BDF attempts in the state trans
 and checkpoints Krasis state together with Methodus history. Checkpoints bind to Finitum's
 concrete realization digest, so same-size mesh, constraint, coefficient, or material changes are
 refused. No forwarding adapter or copied numerical contract sits between the owning repositories.
-FC10 also provides `CrossDialectOperator`, which composes two distinct Finitum discrete families
-with explicit bidirectional off-diagonal derivative blocks and implements Methodus's DAE and
-block-nonlinear contracts without named-physics branching.
+`CoupledSystemOperator` (W7, SC-W1) composes N realization groups across Finitum realization
+plans: each `CoupledLeaf` is a Methodus `DaeOperator` over its own state layout bound to
+system-level semantic ids, each `CouplingEdge` a Methodus `LinearOperator` from one leaf's state
+or rate into another leaf's residual, with an explicit coupling graph whose strongly connected
+components give the sequential schedule or the fixed-point blocks. It implements Methodus's DAE,
+nonlinear and block-nonlinear contracts (one block per leaf), so `bdf_step`, `solve_newton` and
+`solve_blocks` drive it unchanged, and `CoupledExecution` encloses it in the same transaction
+as a single realization. `BlockLinearExecution` is the steady-runner target: it drives one
+Methodus Krylov algorithm chosen by policy over a committed block state and binds checkpoints to
+the operator's content digest. It covers and retires FC10's `CrossDialectOperator`.
 
 SV0-B4 adds reusable, serializable verification reports for transactional rollback,
 checkpoint/restart trajectory identity, isolated cross-block derivatives, counted block-strategy

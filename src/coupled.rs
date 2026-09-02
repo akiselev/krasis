@@ -25,9 +25,17 @@ pub enum RowKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct ConsistentInitialization {
-    mask: Vec<RowKind>,
-    newton: NewtonConfig,
+pub(crate) struct ConsistentInitialization {
+    pub(crate) mask: Vec<RowKind>,
+    pub(crate) newton: NewtonConfig,
+}
+
+/// A Krasis-composed DAE operator that [`CoupledExecution`] can enclose in a transaction:
+/// it carries a content identity (folded into every checkpoint) and the identity of the
+/// [`StateLayout`] its state vector is laid out by.
+pub trait TransactionalOperator: DaeOperator + Clone + std::fmt::Debug {
+    fn identity(&self) -> &str;
+    fn state_layout_identity(&self) -> &str;
 }
 
 /// Krasis-owned composition of a realized Finitum action into Methodus contracts.
@@ -129,6 +137,18 @@ impl CoupledOperator {
         self.state_binding.as_ref()
     }
 
+    pub fn state_layout_identity(&self) -> &str {
+        &self.state_layout_identity
+    }
+
+    /// The per-row differential/algebraic mask recorded by
+    /// [`Self::with_consistent_initialization`], if any.
+    pub fn row_kinds(&self) -> Option<&[RowKind]> {
+        self.consistent_initialization
+            .as_ref()
+            .map(|config| config.mask.as_slice())
+    }
+
     /// Additively record a per-row differential/algebraic mask and Newton policy for index-1
     /// consistent initialization, folding both into the operator identity.
     ///
@@ -175,11 +195,41 @@ impl CoupledOperator {
                 "operator has no differential/algebraic mask for consistent initialization".into(),
             )
         })?;
-        if state.len() != self.dimension() {
+        solve_consistent_state_rate_for(self, &config.mask, &config.newton, context, time, state)
+    }
+
+    fn numeric_error(error: finitum::FinitumError) -> NumericError {
+        NumericError::Operator {
+            message: error.to_string(),
+        }
+    }
+}
+
+/// Solve `F(time, state, ydot) = 0` for `ydot` restricted to the rows `mask` marks
+/// `Differential`, by dense Newton over a reduced-rate wrapper of `operator`; algebraic rows
+/// keep rate zero and must already vanish at `state` (see
+/// [`CoupledOperator::solve_consistent_state_rate`]). Shared by every Krasis-composed operator.
+pub(crate) fn solve_consistent_state_rate_for<O: DaeOperator + ?Sized>(
+    operator: &O,
+    mask: &[RowKind],
+    newton: &NewtonConfig,
+    context: &EvaluationContext,
+    time: f64,
+    state: &[f64],
+) -> Result<Vec<f64>, KrasisError> {
+    {
+        let dimension = operator.dimension();
+        if mask.len() != dimension {
+            return Err(KrasisError::ConsistentInitializationMaskLength {
+                actual: mask.len(),
+                expected: dimension,
+            });
+        }
+        if state.len() != dimension {
             return Err(KrasisError::InvalidCoupling(format!(
                 "state length {} differs from operator dimension {}",
                 state.len(),
-                self.dimension()
+                dimension
             )));
         }
         if !time.is_finite() {
@@ -196,29 +246,27 @@ impl CoupledOperator {
         // The unknown is the state rate restricted to differential rows; an algebraic row
         // never contributes a rate unknown (its residual is defined not to depend on `ydot`,
         // matching a semi-explicit index-1 DAE), so its rate is fixed at zero while solving.
-        let differential_rows: Vec<usize> = config
-            .mask
+        let differential_rows: Vec<usize> = mask
             .iter()
             .enumerate()
             .filter(|(_, row)| matches!(row, RowKind::Differential))
             .map(|(index, _)| index)
             .collect();
-        let algebraic_rows: Vec<usize> = config
-            .mask
+        let algebraic_rows: Vec<usize> = mask
             .iter()
             .enumerate()
             .filter(|(_, row)| matches!(row, RowKind::Algebraic))
             .map(|(index, _)| index)
             .collect();
 
-        struct ReducedRateOperator<'a> {
-            operator: &'a CoupledOperator,
+        struct ReducedRateOperator<'a, O: DaeOperator + ?Sized> {
+            operator: &'a O,
             time: f64,
             differential_state: &'a [f64],
             differential_rows: &'a [usize],
         }
 
-        impl ReducedRateOperator<'_> {
+        impl<O: DaeOperator + ?Sized> ReducedRateOperator<'_, O> {
             fn expand(&self, reduced: &[f64]) -> Vec<f64> {
                 let mut full = vec![0.0; self.operator.dimension()];
                 for (local, &global) in self.differential_rows.iter().enumerate() {
@@ -234,7 +282,7 @@ impl CoupledOperator {
             }
         }
 
-        impl NonlinearOperator for ReducedRateOperator<'_> {
+        impl<O: DaeOperator + ?Sized> NonlinearOperator for ReducedRateOperator<'_, O> {
             fn dimension(&self) -> usize {
                 self.differential_rows.len()
             }
@@ -286,13 +334,13 @@ impl CoupledOperator {
         }
 
         let wrapper = ReducedRateOperator {
-            operator: self,
+            operator,
             time,
             differential_state: state,
             differential_rows: &differential_rows,
         };
         let initial_guess = vec![0.0; differential_rows.len()];
-        let report = solve_newton(&wrapper, context, &initial_guess, &config.newton)
+        let report = solve_newton(&wrapper, context, &initial_guess, newton)
             .map_err(|error| KrasisError::Solve(error.to_string()))?;
         if !report.converged {
             return Err(KrasisError::Solve(
@@ -305,7 +353,7 @@ impl CoupledOperator {
             ));
         }
 
-        let mut state_rate = vec![0.0; self.dimension()];
+        let mut state_rate = vec![0.0; dimension];
         for (local, &global) in differential_rows.iter().enumerate() {
             state_rate[global] = report.state[local];
         }
@@ -315,16 +363,17 @@ impl CoupledOperator {
         // consistent with the algebraic constraint, and no choice of differential state rate
         // can fix it.
         if !algebraic_rows.is_empty() {
-            let mut residual = vec![0.0; self.dimension()];
-            DaeOperator::residual(self, context, time, state, &state_rate, &mut residual)
+            let mut residual = vec![0.0; dimension];
+            operator
+                .residual(context, time, state, &state_rate, &mut residual)
                 .map_err(|error| KrasisError::Solve(error.to_string()))?;
             for &row in &algebraic_rows {
-                if residual[row].abs() > config.newton.absolute_tolerance {
+                if residual[row].abs() > newton.absolute_tolerance {
                     return Err(KrasisError::InvalidCoupling(format!(
                         "row {row} is marked algebraic but has residual {} at the supplied \
                          initial state, which exceeds the configured absolute tolerance {}; the \
                          initial condition is not consistent with the algebraic constraint",
-                        residual[row], config.newton.absolute_tolerance
+                        residual[row], newton.absolute_tolerance
                     )));
                 }
             }
@@ -332,15 +381,12 @@ impl CoupledOperator {
 
         Ok(state_rate)
     }
-
-    fn numeric_error(error: finitum::FinitumError) -> NumericError {
-        NumericError::Operator {
-            message: error.to_string(),
-        }
-    }
 }
 
-fn consistent_initialization_identity(mask: &[RowKind], newton: &NewtonConfig) -> String {
+pub(crate) fn consistent_initialization_identity(
+    mask: &[RowKind],
+    newton: &NewtonConfig,
+) -> String {
     #[derive(Serialize)]
     struct Payload<'a> {
         schema: &'static str,
@@ -464,17 +510,29 @@ pub struct CoupledCheckpoint {
     pub integrator: BdfState,
 }
 
-/// Transactional execution state for implicit transient solves.
+impl TransactionalOperator for CoupledOperator {
+    fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    fn state_layout_identity(&self) -> &str {
+        &self.state_layout_identity
+    }
+}
+
+/// Transactional execution state for implicit transient solves over any
+/// [`TransactionalOperator`]: a single Finitum realization ([`CoupledOperator`], the default)
+/// or an N-leaf composition across realization plans ([`crate::CoupledSystemOperator`]).
 #[derive(Clone, Debug)]
-pub struct CoupledExecution {
-    operator: CoupledOperator,
+pub struct CoupledExecution<Op: TransactionalOperator = CoupledOperator> {
+    operator: Op,
     state: SimulationState,
     integrator: BdfState,
 }
 
-impl CoupledExecution {
+impl<Op: TransactionalOperator> CoupledExecution<Op> {
     pub fn new(
-        operator: CoupledOperator,
+        operator: Op,
         state: SimulationState,
         context: &EvaluationContext,
     ) -> Result<Self, KrasisError> {
@@ -483,7 +541,7 @@ impl CoupledExecution {
                 "coupled execution must start from committed state".into(),
             ));
         }
-        if state.layout().identity() != operator.state_layout_identity {
+        if state.layout().identity() != operator.state_layout_identity() {
             return Err(KrasisError::InvalidCoupling(
                 "state layout does not match the coupled operator".into(),
             ));
@@ -505,7 +563,7 @@ impl CoupledExecution {
         Ok(execution)
     }
 
-    pub fn operator(&self) -> &CoupledOperator {
+    pub fn operator(&self) -> &Op {
         &self.operator
     }
 
@@ -554,7 +612,7 @@ impl CoupledExecution {
     pub fn checkpoint(&self) -> Result<CoupledCheckpoint, KrasisError> {
         self.validate_synchronized()?;
         Ok(CoupledCheckpoint {
-            operator_identity: self.operator.identity.clone(),
+            operator_identity: self.operator.identity().to_owned(),
             state: self.state.checkpoint()?,
             integrator: self.integrator.clone(),
         })
@@ -562,10 +620,11 @@ impl CoupledExecution {
 
     /// Atomically restore transactional state and BDF history after validating their identity.
     pub fn restore(&mut self, checkpoint: &CoupledCheckpoint) -> Result<(), KrasisError> {
-        if checkpoint.operator_identity != self.operator.identity {
+        if checkpoint.operator_identity != self.operator.identity() {
             return Err(KrasisError::InvalidCoupling(format!(
                 "checkpoint operator identity `{}` does not match `{}`",
-                checkpoint.operator_identity, self.operator.identity
+                checkpoint.operator_identity,
+                self.operator.identity()
             )));
         }
         let mut candidate = self.state.clone();
@@ -573,7 +632,7 @@ impl CoupledExecution {
         validate_pair(
             &candidate,
             &checkpoint.integrator,
-            self.operator.dimension(),
+            DaeOperator::dimension(&self.operator),
         )?;
         self.state = candidate;
         self.integrator = checkpoint.integrator.clone();
@@ -581,7 +640,11 @@ impl CoupledExecution {
     }
 
     fn validate_synchronized(&self) -> Result<(), KrasisError> {
-        validate_pair(&self.state, &self.integrator, self.operator.dimension())
+        validate_pair(
+            &self.state,
+            &self.integrator,
+            DaeOperator::dimension(&self.operator),
+        )
     }
 }
 

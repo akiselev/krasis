@@ -1,9 +1,19 @@
 //! Additive binding of state blocks to opaque semantic identities.
 //!
 //! Krasis has no dependency on Scientia. [`SemanticId`] mirrors the wire representation of
-//! Scientia's `SymbolId` (a dense `u32` arena index) so a caller holding a `SymbolId` can bind
-//! state blocks by semantic identity without Krasis depending on Scientia's crate: construct the
-//! matching [`SemanticId`] with [`SemanticId::new`], passing the `SymbolId`'s underlying `u32`.
+//! Scientia's **system-level** variable id (`SysVarId`, a dense `u32` allocated by system
+//! elaboration across every instance of every model; `sinbad/ARCHITECTURE.md` §2.3-2.4,
+//! GX-CONTRACTS C11.8 as amended by C12) so a caller holding one can bind state blocks by
+//! semantic identity without Krasis depending on Scientia's crate: construct the matching
+//! [`SemanticId`] with [`SemanticId::new`], passing the id's underlying `u32`. Krasis reads it
+//! from Finitum's re-keyed `BlockLayout` ([`crate::block_state_layout`]), never from Scientia.
+//!
+//! The system-level meaning is what makes cross-plan composition sound: two instances of one
+//! model share every per-model `SymbolId`, so binding by `SymbolId` would collide the moment a
+//! second instance appeared, whereas `SysVarId`s are dense and unique across the whole system.
+//! [`crate::CoupledSystemOperator`] therefore refuses a semantic id shared by two leaves. For a
+//! single-model system (the implicit one-instance system) the two ids coincide numerically, so
+//! every existing binding keeps its value.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,7 +21,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BlockId, KrasisError, StateLayout};
 
-/// Opaque semantic identity for a state block, convention-compatible with Scientia `SymbolId`.
+/// Opaque semantic identity for a state block, convention-compatible with Scientia's
+/// system-level `SysVarId` (numerically equal to the per-model `SymbolId` for a one-instance
+/// system).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SemanticId(u32);
 
