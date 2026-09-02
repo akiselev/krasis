@@ -108,3 +108,16 @@ Demand-pulled next work (workspace `PLAN.md` §6):
    adjoints demand it;
 3. DAE index-1 consistent initialization beyond reduced-row, and coupled
    event persistence — still only from a concrete product case.
+4. SC composition (design `sinbad/ARCHITECTURE.md` §8, §12; nothing landed).
+   `SemanticId` keeps its `u32` type and comes to mirror Scientia's system-level
+   `SysVarId` (a one-line C11.8 amendment). Prerequisite batch P: N-block DAE
+   composition over `SystemRealizationPlan` with Newton inside BDF, so 08 can
+   execute monolithically. SC-W1: `CoupledSystemOperator` implementing
+   `NonlinearOperator`/`DaeOperator`/`BlockNonlinearOperator` over Finitum leaf
+   actions and connection realizations (this is SV1-F1 / SV7-F2 / SV4-H1 — the
+   IDs are kept), plus the separately gated reroute of Sinbad's steady system
+   runner through `BlockLinearExecution` (25-stokes and 13-mixed-darcy must
+   reproduce today's solutions within 1e-12 relative before the old path goes).
+   `CrossDialectOperator` is retired once `CoupledSystemOperator` covers its FC10
+   test. Partitioned-iteration state and output-based convergence evaluation live
+   in the fixed-point transaction (SC-W3).
