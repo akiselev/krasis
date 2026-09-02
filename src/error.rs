@@ -54,6 +54,13 @@ pub enum KrasisError {
     InvalidCoupling(String),
     #[error("coupled numerical solve failed: {0}")]
     Solve(String),
+    #[error(
+        "{algorithm} did not converge within the configured tolerance after {iterations} iterations"
+    )]
+    SolveDidNotConverge {
+        algorithm: String,
+        iterations: usize,
+    },
     #[error("nodal context has no vertex coordinates")]
     EmptyNodalContext,
     #[error(

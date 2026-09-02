@@ -33,10 +33,12 @@ use finitum::{
     MixedSpace, VertexId,
 };
 use krasis::{
-    BlockId, BlockLinearExecution, FieldId, KrasisError, SimulationState, StateBlock, StateLayout,
-    TransactionPhase, block_state_layout,
+    BlockId, BlockLinearAlgorithm, BlockLinearExecution, BlockLinearSolver, FieldId, KrasisError,
+    SimulationState, StateBlock, StateLayout, TransactionPhase, block_state_layout,
 };
-use methodus::{EvaluationContext, LinearOperator, MinresConfig, NullspaceProjector};
+use methodus::{
+    BlockLinearOperator, EvaluationContext, LinearOperator, MinresConfig, NullspaceProjector,
+};
 use scientia::SymbolId;
 
 const FIELD_A: SymbolId = SymbolId(0);
@@ -180,13 +182,16 @@ fn minres_reaches_the_expected_solution_with_rollback_restart_and_history_eviden
     let mut execution = BlockLinearExecution::new(&operator, zero_state(&state_layout)).unwrap();
 
     let context = EvaluationContext::reproducible();
-    let config = MinresConfig::default();
+    let config = BlockLinearSolver::Minres(MinresConfig::default());
 
     // --- Solve 1: converges, commits, becomes the new committed state. ---
     let rhs_1 = consistent_right_hand_side(&operator, 7);
     let report = execution
         .solve(&context, &rhs_1, None, None, &config, 1.0)
         .unwrap();
+    assert_eq!(report.algorithm, BlockLinearAlgorithm::Minres);
+    assert_eq!(report.restart_cycles, None);
+    let report = report.report;
     assert!(report.converged);
     assert!(residual_norm(&operator, &report.solution, &rhs_1) < 1.0e-6);
     let solution_1 = report.solution.clone();
@@ -204,7 +209,8 @@ fn minres_reaches_the_expected_solution_with_rollback_restart_and_history_eviden
     let rhs_2 = consistent_right_hand_side(&operator, 13);
     let report_2 = execution
         .solve(&context, &rhs_2, None, None, &config, 2.0)
-        .unwrap();
+        .unwrap()
+        .report;
     assert!(report_2.converged);
     assert!(residual_norm(&operator, &report_2.solution, &rhs_2) < 1.0e-6);
     let solution_2 = report_2.solution.clone();
@@ -218,15 +224,21 @@ fn minres_reaches_the_expected_solution_with_rollback_restart_and_history_eviden
     );
 
     // --- Rollback evidence: a config too tight to converge in one iteration never commits. ---
-    let unreachable = MinresConfig {
+    let unreachable = BlockLinearSolver::Minres(MinresConfig {
         max_iterations: 1,
         absolute_tolerance: 1.0e-14,
         relative_tolerance: 1.0e-14,
-    };
+    });
     let error = execution
         .solve(&context, &rhs_1, None, None, &unreachable, 3.0)
         .unwrap_err();
-    assert!(matches!(error, KrasisError::Solve(_)), "{error:?}");
+    assert_eq!(
+        error,
+        KrasisError::SolveDidNotConverge {
+            algorithm: "minres".into(),
+            iterations: 1,
+        }
+    );
     assert_eq!(
         execution.state().committed_vector().unwrap(),
         solution_2,
@@ -263,10 +275,11 @@ fn nullspace_projector_path_converges_the_declared_reduced_residual() {
             &rhs,
             None,
             Some(mode.projector()),
-            &MinresConfig::default(),
+            &BlockLinearSolver::Minres(MinresConfig::default()),
             1.0,
         )
-        .unwrap();
+        .unwrap()
+        .report;
     assert!(report.converged);
 
     let mut raw_residual = vec![0.0; operator.dimension()];
@@ -303,11 +316,11 @@ fn a_non_converged_solve_never_commits_and_state_stays_untouched() {
 
     let rhs = consistent_right_hand_side(&operator, 5);
 
-    let unreachable = MinresConfig {
+    let unreachable = BlockLinearSolver::Minres(MinresConfig {
         max_iterations: 1,
         absolute_tolerance: 1.0e-14,
         relative_tolerance: 1.0e-14,
-    };
+    });
     let error = execution
         .solve(
             &EvaluationContext::reproducible(),
@@ -318,7 +331,10 @@ fn a_non_converged_solve_never_commits_and_state_stays_untouched() {
             1.0,
         )
         .unwrap_err();
-    assert!(matches!(error, KrasisError::Solve(_)), "{error:?}");
+    assert!(
+        matches!(error, KrasisError::SolveDidNotConverge { .. }),
+        "{error:?}"
+    );
     assert_eq!(execution.state().committed_vector().unwrap(), before);
     assert_eq!(execution.state().phase(), TransactionPhase::Committed);
 }
@@ -373,4 +389,71 @@ fn restore_refuses_a_checkpoint_from_a_different_operator_identity() {
         matches!(error, KrasisError::InvalidCoupling(_)),
         "{error:?}"
     );
+}
+
+/// `krasis-block-linear/2` is content-addressed: two `MixedOperator`s over the same mesh and
+/// block layout that differ only in a coupling scale (identical shape, identical declared
+/// properties) must produce different execution identities, so a checkpoint taken against one
+/// is refused by the other. Under the shape-only `/1` identity these were indistinguishable.
+#[test]
+fn checkpoint_identity_distinguishes_operators_of_equal_shape_but_different_content() {
+    let baseline = MixedOperator::new(fixture_space(1), fixture_couplings()).unwrap();
+    let mut rescaled_couplings = fixture_couplings();
+    rescaled_couplings[1].scale = 2.0;
+    let rescaled = MixedOperator::new(fixture_space(1), rescaled_couplings).unwrap();
+    assert_eq!(baseline.block_layout(), rescaled.block_layout());
+    assert_eq!(baseline.properties(), rescaled.properties());
+    assert_ne!(baseline.digest(), rescaled.digest());
+
+    let (layout, _) = block_state_layout(baseline.space().layout()).unwrap();
+    let mut execution_a = BlockLinearExecution::new(&baseline, zero_state(&layout)).unwrap();
+    let execution_b = BlockLinearExecution::new(&rescaled, zero_state(&layout)).unwrap();
+    assert_ne!(
+        execution_a.operator_identity(),
+        execution_b.operator_identity()
+    );
+
+    let error = execution_a
+        .restore(&execution_b.checkpoint().unwrap())
+        .unwrap_err();
+    assert!(
+        matches!(error, KrasisError::InvalidCoupling(_)),
+        "{error:?}"
+    );
+
+    // The identity is canonical: an operator rebuilt from the same inputs reproduces it.
+    let rebuilt = MixedOperator::new(fixture_space(1), fixture_couplings()).unwrap();
+    let execution_rebuilt = BlockLinearExecution::new(&rebuilt, zero_state(&layout)).unwrap();
+    assert_eq!(
+        execution_a.operator_identity(),
+        execution_rebuilt.operator_identity()
+    );
+}
+
+/// A nullspace projector is only meaningful to MINRES; asking for one with GMRES is refused
+/// typed, and nothing is committed.
+#[test]
+fn a_projector_with_a_non_minres_algorithm_is_refused_before_any_solve() {
+    let operator = MixedOperator::new(fixture_space(1), fixture_couplings()).unwrap();
+    let (layout, _) = block_state_layout(operator.space().layout()).unwrap();
+    let mut execution = BlockLinearExecution::new(&operator, zero_state(&layout)).unwrap();
+    let candidate = BlockNullspaceCandidate::constant(FIELD_B, "field_a carries no Dirichlet data");
+    let mode = candidate.resolve(operator.space().layout()).unwrap();
+    let rhs = consistent_right_hand_side(&operator, 3);
+    let error = execution
+        .solve(
+            &EvaluationContext::reproducible(),
+            &rhs,
+            None,
+            Some(mode.projector()),
+            &BlockLinearSolver::Gmres(methodus::GmresConfig::default()),
+            1.0,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, KrasisError::InvalidCoupling(_)),
+        "{error:?}"
+    );
+    assert_eq!(execution.state().phase(), TransactionPhase::Committed);
+    assert_eq!(execution.state().time(), 0.0);
 }

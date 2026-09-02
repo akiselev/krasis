@@ -83,6 +83,24 @@ impl SimulationState {
         }
     }
 
+    /// A committed state with every block of `layout` initialized to zero -- the initial guess a
+    /// steady solve starts from (`BlockLinearExecution`), keyed to the layout's own block ids.
+    pub fn zeroed(layout: StateLayout, history_limit: usize) -> Self {
+        let mut state = Self::new(layout, history_limit);
+        let blocks: Vec<(FieldId, usize)> = state
+            .layout
+            .blocks()
+            .iter()
+            .map(|block| (FieldId::new(block.id().as_str()), block.range().len()))
+            .collect();
+        for (field, width) in blocks {
+            state
+                .insert_field(field, vec![0.0; width])
+                .expect("a fresh layout has no fields yet and every block id is unique");
+        }
+        state
+    }
+
     pub fn layout(&self) -> &StateLayout {
         &self.layout
     }

@@ -15,7 +15,10 @@ mod verification;
 
 pub use binding::{SemanticId, StateBinding};
 pub use block_binding::block_state_layout;
-pub use block_solve::{BlockLinearCheckpoint, BlockLinearExecution};
+pub use block_solve::{
+    BlockLinearAlgorithm, BlockLinearCheckpoint, BlockLinearExecution, BlockLinearReport,
+    BlockLinearSolver, OperatorIdentity,
+};
 pub use checkpoint::Checkpoint;
 pub use coupled::{CoupledCheckpoint, CoupledExecution, CoupledOperator, RowKind};
 pub use error::KrasisError;

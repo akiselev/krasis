@@ -2,7 +2,8 @@
 
 Updated: 2026-09-01
 Milestone: SV0-B4 reusable coupled verification + GX-D1 initial-condition
-projection + E6 transactional block-linear composition
+projection + E6 transactional block-linear composition + W7 SC-W1 steady-runner
+target (`BlockLinearExecution` content-addressed, CG/MINRES/GMRES)
 
 ## Implemented
 
@@ -52,6 +53,22 @@ projection + E6 transactional block-linear composition
   cross-operator checkpoint restores; six acceptance tests compose finitum's real
   vector-P2/scalar-P1 `MixedOperator` saddle-point fixture with rollback/restart/history
   evidence (40 tests total at that head).
+- W7 / SC-W1 steady-runner target (this commit): `BlockLinearExecution` is now the entry point
+  Sinbad's steady system runner reroutes through. `OperatorIdentity` (Krasis trait, implemented
+  for `finitum::MixedOperator`, `SystemOperator`, `ReducedSystemOperator` from their own content
+  digests plus the serialized `ConstraintSet`) folds the operator's numerical content into the
+  `krasis-block-linear/2` checkpoint identity -- `/1` hashed shape only and could not tell two
+  operators over one layout apart (STATUS Next item 1, closed). `solve` takes a
+  `BlockLinearSolver::{ConjugateGradient, Minres, Gmres}` policy and returns a
+  `BlockLinearReport { algorithm, report, restart_cycles }`; non-convergence is the typed
+  `KrasisError::SolveDidNotConverge { algorithm, iterations }` after rollback; a nullspace
+  projector with a non-MINRES algorithm is refused typed. `SimulationState::zeroed(layout,
+  history)` is the zero initial guess a steady solve starts from. `tests/sc_w1_steady_reroute.rs`
+  runs the 25-stokes corpus through exactly Sinbad's Finitum path (`SystemRealizationPlan` ->
+  `bind_kernels` with the corpus `equation_sign` -> wall constraints -> `reduced` -> verified
+  pressure nullspace -> `load_vector`) and proves the Krasis-transacted MINRES and GMRES
+  solutions and traces are **bit-identical** to the direct Methodus calls (46 tests at this
+  head).
 
 ## Boundary
 
@@ -81,6 +98,16 @@ RUSTDOCFLAGS='-D warnings' cargo test --locked --workspace --doc
 git diff --check
 ```
 
+W7 (2026-09-01, Rust 1.97.0), per commit; note that `cargo fmt --all` also formats local
+path dependencies (sibling repositories), so this wave formats Krasis alone:
+
+```text
+cargo fmt -p krasis -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test                                              # 46 passed, 0 failed (SC-W1 commit)
+RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
+```
+
 ## Known limits recorded by the 2026-08-30 workspace audit (tree `bb2abe4`)
 
 The first two bullets describe the pre-GX-D1 state and are superseded by
@@ -100,9 +127,8 @@ The first two bullets describe the pre-GX-D1 state and are superseded by
 GX-D1 and the E6 block-linear composition are landed (`e4478f5`, `91dfd25`).
 Demand-pulled next work (workspace `PLAN.md` §6):
 
-1. fold `finitum::MixedOperator::digest()` (finitum `96edb6d`) into
-   `BlockLinearCheckpoint`'s operator identity — content-addressed instead of
-   shape-only — once Krasis binds a `MixedOperator` concretely;
+1. ~~fold `finitum::MixedOperator::digest()` into `BlockLinearCheckpoint`'s
+   operator identity~~ — landed in W7 (`OperatorIdentity`, `krasis-block-linear/2`);
 2. block composition over the executable `SystemRealizationPlan` operators
    (finitum `739e2aa`+) as coupled/transient Stokes and the E7 trajectory
    adjoints demand it;
@@ -118,6 +144,15 @@ Demand-pulled next work (workspace `PLAN.md` §6):
    IDs are kept), plus the separately gated reroute of Sinbad's steady system
    runner through `BlockLinearExecution` (25-stokes and 13-mixed-darcy must
    reproduce today's solutions within 1e-12 relative before the old path goes).
+   The Krasis side of the reroute is landed (W7): Sinbad builds the reduced
+   operator exactly as today, then `block_state_layout(reduced.operator()
+   .layout())`, `SimulationState::zeroed(layout, history)`,
+   `BlockLinearExecution::new(&reduced, state)`, and `solve(ctx, &rhs, None,
+   projector, &BlockLinearSolver::Minres(cfg), 0.0)`; the report's `report` is
+   the unchanged Methodus `LinearSolveReport`, `restart_cycles` the GMRES
+   count, `algorithm.label()` the receipt string. The bitwise agreement on
+   25-stokes is proven in `tests/sc_w1_steady_reroute.rs`; 13-mixed-darcy goes
+   through the same call with `bind_kernels_with_facets` and is Sinbad's gate.
    `CrossDialectOperator` is retired once `CoupledSystemOperator` covers its FC10
    test. Partitioned-iteration state and output-based convergence evaluation live
    in the fixed-point transaction (SC-W3).
