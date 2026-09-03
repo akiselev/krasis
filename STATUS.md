@@ -209,10 +209,13 @@ W7 landed (this head): the content-addressed `BlockLinearExecution` steady-runne
    `KrasisError::SolveDidNotConverge { algorithm, iterations }` after rollback).
 5. **Upstream (Finitum, still open, C11.8):** the P1 single-point quadrature makes the
    consistent mass matrix rank-deficient; a pure reaction leaf's BDF Newton system is singular
-   on its own. The Finitum heat leaves in `tests/coupled_finitum_system.rs` run BDF (mass +
-   stiffness is nonsingular) without `with_consistent_initialization`, whose consistent-rate
-   solve is over the mass block alone and was not exercised on them; the composed
-   consistent-initialization test stays on the network DAE.
+   on its own. Scope, per Finitum `2969369`: this is the single-model `RealizationPlan` path
+   (`PreparedElement::linear_simplex`, what `CoupledOperator` wraps; the exact rule is opt-in
+   there via `linear_simplex_with_degree`). The `SystemRealizationPlan` path that
+   `CoupledLeaf::reduced_system` wraps integrates the P1 mass exactly, and
+   `tests/coupled_finitum_system.rs` exercises the composed index-1 consistent initialization
+   on it (the consistent rate zeroes every differential row of the composed residual with the
+   cross edge included; every `CoupledExecution::new` there runs it).
 6. DAE index-1 consistent initialization beyond reduced-row, and coupled event persistence --
    still only from a concrete product case. `CoupledSystemOperator` concatenates leaf events
    (`event_count`/`event_values`) but `CoupledExecution` still does not persist event records.

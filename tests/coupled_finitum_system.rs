@@ -254,7 +254,17 @@ fn two_heat_leaves(compiled: &Compiled, gamma: f64) -> Fixture {
             sampling_matrix(&cold, &hot, -gamma),
         )]
     };
-    let operator = CoupledSystemOperator::new(vec![hot_leaf, cold_leaf], edges).unwrap();
+    // Finitum's system path integrates the P1 mass exactly (degree-4 triangle rule), so the
+    // composed index-1 consistent initialization is well posed here; `CoupledExecution::new`
+    // runs it through Methodus's `BdfState::initialize`.
+    let operator = CoupledSystemOperator::new(vec![hot_leaf, cold_leaf], edges)
+        .unwrap()
+        .with_consistent_initialization(NewtonConfig {
+            absolute_tolerance: 1.0e-13,
+            relative_tolerance: 1.0e-12,
+            ..NewtonConfig::default()
+        })
+        .unwrap();
     Fixture {
         operator,
         hot,
@@ -474,6 +484,39 @@ fn finitum_reduced_system_leaves_compose_into_one_transient_dae() {
     assert!(
         discrepancy <= 1.0e-6,
         "composed DAE JVP discrepancy {discrepancy}"
+    );
+
+    // The consistent initial rate solved over the composed residual (cross edge included):
+    // every differential row of `F(0, y0, ydot)` vanishes, every wall row's rate is zero.
+    let initial = initial_values(&fixture);
+    let consistent = operator
+        .solve_consistent_state_rate(&context, 0.0, &initial)
+        .unwrap();
+    let mut residual = vec![0.0; dimension];
+    operator
+        .residual(&context, 0.0, &initial, &consistent, &mut residual)
+        .unwrap();
+    let mut differential_rows = 0;
+    for (row, kind) in hot.row_kinds.iter().chain(&cold.row_kinds).enumerate() {
+        match kind {
+            RowKind::Differential => {
+                differential_rows += 1;
+                assert!(
+                    residual[row].abs() <= 1.0e-9,
+                    "row {row}: {}",
+                    residual[row]
+                );
+            }
+            RowKind::Algebraic => assert_eq!(consistent[row], 0.0),
+        }
+    }
+    assert!(differential_rows > 0);
+    let cold_start = operator.leaf_range(1).unwrap().start;
+    assert!(
+        consistent[cold_start..]
+            .iter()
+            .any(|rate| rate.abs() > 1.0e-3),
+        "the exchange drives the cold instance from rest"
     );
 }
 
