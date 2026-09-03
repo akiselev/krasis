@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use finitum::RealizationPlan;
 use methodus::{
     BdfConfig, BdfState, BlockLayout as SolverBlockLayout, BlockNonlinearOperator, BlockSpec,
-    DaeOperator, EvaluationContext, NewtonConfig, NonlinearOperator, NumericError, StepOutcome,
-    bdf_step, solve_newton,
+    DaeOperator, EvaluationContext, NewtonConfig, NonlinearOperator, NonlinearSolver, NumericError,
+    SolveError, StepOutcome, bdf_step, bdf_step_with, solve_newton,
 };
 use serde::{Deserialize, Serialize};
 
@@ -575,16 +575,47 @@ impl<Op: TransactionalOperator> CoupledExecution<Op> {
         &self.integrator
     }
 
-    /// Attempt one Methodus BDF step inside the Krasis trial transaction.
+    /// Attempt one Methodus BDF step inside the Krasis trial transaction, with the dense Newton
+    /// solve `bdf_step` runs from `config.newton`.
     pub fn attempt_step(
         &mut self,
         context: &EvaluationContext,
         step: f64,
         config: &BdfConfig,
     ) -> Result<StepOutcome, KrasisError> {
+        self.transact_step(|operator, integrator| {
+            bdf_step(operator, context, integrator, step, config)
+        })
+    }
+
+    /// Attempt one Methodus BDF step inside the Krasis trial transaction, with the nonlinear
+    /// solve delegated to `solver` (`methodus::bdf_step_with`): a `NewtonKrylovSolver` for a
+    /// matrix-free inexact Newton over the step's Jacobian action, a `BlockNewton` for
+    /// partitioned Gauss-Seidel/Jacobi iteration over the operator's block layout inside the
+    /// step, or `DenseNewton`. `config.newton` is not consulted; the commit/rollback
+    /// protocol is exactly [`Self::attempt_step`]'s.
+    pub fn attempt_step_with(
+        &mut self,
+        context: &EvaluationContext,
+        step: f64,
+        config: &BdfConfig,
+        solver: &dyn NonlinearSolver,
+    ) -> Result<StepOutcome, KrasisError> {
+        self.transact_step(|operator, integrator| {
+            bdf_step_with(operator, context, integrator, step, config, solver)
+        })
+    }
+
+    /// One BDF attempt enclosed in `begin_trial` / `commit` / `rollback`: an accepted step
+    /// commits the new values at the step's time; a rejected step or a solver error rolls the
+    /// trial back and leaves the committed state and the BDF history untouched.
+    fn transact_step(
+        &mut self,
+        attempt: impl FnOnce(&Op, &BdfState) -> Result<StepOutcome, SolveError>,
+    ) -> Result<StepOutcome, KrasisError> {
         self.validate_synchronized()?;
         self.state.begin_trial()?;
-        let outcome = match bdf_step(&self.operator, context, &self.integrator, step, config) {
+        let outcome = match attempt(&self.operator, &self.integrator) {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.state.rollback()?;

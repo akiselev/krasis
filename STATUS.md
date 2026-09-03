@@ -1,6 +1,6 @@
 # Krasis status
 
-Updated: 2026-09-01
+Updated: 2026-09-03
 Milestone: SV0-B4 reusable coupled verification + GX-D1 initial-condition
 projection + E6 transactional block-linear composition + W7 batch P / SC-W1
 (`CoupledSystemOperator` N-leaf DAE composition with Newton inside BDF, the SV7-F2
@@ -101,6 +101,15 @@ coupling graph, content-addressed `BlockLinearExecution` steady-runner target)
   agreement (and the SV0-B4 `check_strategy_work` report) on a nontrivial two-mesh Dirichlet
   diffusion pair; graph stages for DAG/cycle/mixed shapes and a one-sweep exactness check of the
   schedule; refusals; canonical identity; the FC10 port. 54 tests at this head.
+- W7 solver hook (this commit): `CoupledExecution::attempt_step_with(ctx, step, config, &dyn
+  methodus::NonlinearSolver)` runs Methodus `bdf_step_with` inside the same trial/commit/rollback
+  transaction as `attempt_step` (one shared `transact_step`), so a matrix-free
+  `NewtonKrylovSolver` (GMRES over the step's Jacobian action) or a partitioned `BlockNewton`
+  (`solve_blocks` Gauss-Seidel/Jacobi over `block_layout()` inside the step) drives the same
+  `CoupledSystemOperator`; `config.newton` is not consulted on that path. Test: both reproduce the
+  dense-Newton BDF2 trajectory of the composed network to 1e-10 and the manufactured solution to
+  the same discretization error, and a hopeless solver rolls the transaction back to the exact
+  prior checkpoint. 55 tests at this head.
 
 ## Boundary
 
@@ -136,7 +145,7 @@ path dependencies (sibling repositories), so this wave formats Krasis alone:
 ```text
 cargo fmt -p krasis -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test                                              # 46 passed (SC-W1 commit); 54 passed (batch P commit)
+cargo test                                              # 46 passed (SC-W1 commit); 54 passed (batch P commit); 55 passed (solver hook)
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
 ```
 
@@ -169,13 +178,9 @@ W7 landed (this head): the content-addressed `BlockLinearExecution` steady-runne
    output)`, `digest()`, `layout()`), a Krasis `CoupledOperator`-style leaf over it is the only
    missing piece and 08 executes monolithically through `CoupledExecution<CoupledSystemOperator>`.
    Today a `ReducedSystemOperator` enters Krasis only through `BlockLinearExecution` (steady).
-2. **Newton-Krylov inside BDF.** Methodus has no Newton-Krylov committed; `bdf_step` runs its
-   dense `solve_newton`. Krasis deliberately does not carry a Newton loop of its own (AGENTS.md:
-   no numerical algorithms in Krasis). Needed from Methodus: `bdf_step` accepting a nonlinear
-   driver other than dense Newton (`NonlinearStrategy { DenseNewton | NewtonKrylov | Blocks }`
-   on `BdfConfig`, or a `bdf_step_with` variant) and `solve_newton_krylov` over the JVP action
-   with GMRES; `BdfState`/`StepOutcome` unchanged so Krasis checkpoints keep their shape. With
-   that, partitioned iteration runs inside a BDF step through the same `CoupledExecution`.
+2. **Newton-Krylov inside BDF** -- landed (Methodus `bf9082f` `bdf_step_with` + `NonlinearSolver`;
+   Krasis `attempt_step_with`). Krasis still carries no Newton loop of its own; `BdfState`/
+   `StepOutcome` are unchanged so checkpoints keep their shape.
 3. **Fixed-point transaction (SC-W3).** The coupling graph and the per-leaf block layout are
    the inputs; partitioned-iteration state, output-based convergence evaluation and
    acceleration wait on Methodus's acceleration hooks (SV7-F3) and on item 2. Not started.

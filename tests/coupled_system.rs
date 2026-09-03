@@ -28,9 +28,11 @@ use krasis::{
     StateBinding, StateBlock, StateLayout, check_strategy_work,
 };
 use methodus::{
-    BdfConfig, BdfOrder, BdfState, BlockNonlinearOperator, BlockStrategy, ComparisonTolerance,
-    CsrMatrix, DaeOperator, EvaluationContext, LinearOperator, NewtonConfig, NonlinearOperator,
-    StepOutcome, WorkBudget, bdf_step, solve_blocks, solve_newton, verify_dae_jvp,
+    BdfConfig, BdfOrder, BdfState, BlockNewton, BlockNonlinearOperator, BlockStrategy,
+    ComparisonTolerance, CsrMatrix, DaeOperator, EvaluationContext, ForcingPolicy, GmresConfig,
+    KrylovMethod, LinearOperator, NewtonConfig, NewtonKrylovConfig, NewtonKrylovSolver,
+    NonlinearOperator, NonlinearSolver, StepOutcome, WorkBudget, bdf_step, solve_blocks,
+    solve_newton, verify_dae_jvp,
 };
 use quantitas::UnitRegistry;
 use scientia::{
@@ -527,6 +529,113 @@ fn newton_inside_bdf_reproduces_the_manufactured_solution_at_first_and_second_or
         "the exchange genuinely moves b off zero: {}",
         b[0]
     );
+}
+
+/// Runs `steps` fixed BDF2 steps through `attempt_step_with(solver)` from `a = 1, b = 0`.
+fn run_fixed_steps_with(
+    operator: &CoupledSystemOperator,
+    step: f64,
+    steps: usize,
+    solver: &dyn NonlinearSolver,
+) -> CoupledExecution<CoupledSystemOperator> {
+    let context = EvaluationContext::reproducible();
+    let mut execution = CoupledExecution::new(
+        operator.clone(),
+        initial_state(operator, 1.0, 0.0),
+        &context,
+    )
+    .unwrap();
+    let config = fixed_step_config(BdfOrder::Two, step);
+    for _ in 0..steps {
+        match execution
+            .attempt_step_with(&context, step, &config, solver)
+            .unwrap()
+        {
+            StepOutcome::Accepted(_) => {}
+            StepOutcome::Rejected(rejected) => panic!("unexpected rejection: {rejected:?}"),
+        }
+    }
+    execution
+}
+
+/// Newton inside BDF through the Methodus solver hook: a matrix-free Newton-Krylov (GMRES over
+/// the step's Jacobian action, no dense Jacobian) and a partitioned Gauss-Seidel `BlockNewton`
+/// over the leaf partition both reproduce the dense-Newton trajectory of the composed system
+/// to solver tolerance, and the manufactured solution to discretization accuracy.
+#[test]
+fn newton_krylov_and_partitioned_newton_inside_bdf_agree_with_dense_newton() {
+    let epsilon = 0.4;
+    let operator = two_block_network(epsilon);
+    let (steps, step) = (16, 0.05);
+    let final_time = steps as f64 * step;
+    let exact = manufactured(&operator, epsilon, final_time);
+
+    let dense = run_fixed_steps(&operator, BdfOrder::Two, step, steps);
+    let dense_final = dense.state().committed_vector().unwrap();
+    let dense_error = max_abs_difference(&dense_final, &exact);
+
+    let method = KrylovMethod::Gmres(GmresConfig {
+        absolute_tolerance: 1.0e-14,
+        relative_tolerance: 1.0e-14,
+        ..GmresConfig::default()
+    });
+    let krylov_config = NewtonKrylovConfig {
+        absolute_tolerance: 1.0e-13,
+        relative_tolerance: 1.0e-12,
+        forcing: ForcingPolicy::Constant { forcing: 1.0e-10 },
+        ..NewtonKrylovConfig::default()
+    };
+    let krylov = NewtonKrylovSolver::new(&method, None, None, &krylov_config);
+    let inexact = run_fixed_steps_with(&operator, step, steps, &krylov);
+    let inexact_final = inexact.state().committed_vector().unwrap();
+    assert_eq!(inexact.state().step(), steps as u64);
+    assert_eq!(inexact.integrator().accepted_steps, steps as u64);
+    let disagreement = max_abs_difference(&inexact_final, &dense_final);
+    assert!(
+        disagreement < 1.0e-10,
+        "Newton-Krylov vs dense Newton: {disagreement}"
+    );
+    let inexact_error = max_abs_difference(&inexact_final, &exact);
+    assert!((inexact_error - dense_error).abs() < 1.0e-10);
+
+    let newton = NewtonConfig {
+        max_iterations: 100,
+        absolute_tolerance: 1.0e-13,
+        relative_tolerance: 1.0e-12,
+        ..NewtonConfig::default()
+    };
+    let partitioned =
+        BlockNewton::new(operator.block_layout(), BlockStrategy::GaussSeidel, &newton);
+    let staggered = run_fixed_steps_with(&operator, step, steps, &partitioned);
+    let staggered_final = staggered.state().committed_vector().unwrap();
+    let disagreement = max_abs_difference(&staggered_final, &dense_final);
+    assert!(
+        disagreement < 1.0e-10,
+        "partitioned Newton vs dense Newton: {disagreement}"
+    );
+
+    // A solver that cannot converge rolls back the transaction like the dense path does.
+    let hopeless_config = NewtonKrylovConfig {
+        max_iterations: 1,
+        absolute_tolerance: 1.0e-300,
+        relative_tolerance: 0.0,
+        forcing: ForcingPolicy::Constant { forcing: 1.0e-10 },
+        ..NewtonKrylovConfig::default()
+    };
+    let hopeless = NewtonKrylovSolver::new(&method, None, None, &hopeless_config);
+    let context = EvaluationContext::reproducible();
+    let mut execution = inexact;
+    let before = execution.checkpoint().unwrap();
+    let error = execution
+        .attempt_step_with(
+            &context,
+            step,
+            &fixed_step_config(BdfOrder::Two, step),
+            &hopeless,
+        )
+        .unwrap_err();
+    assert!(matches!(error, KrasisError::Solve(_)), "{error:?}");
+    assert_eq!(execution.checkpoint().unwrap(), before);
 }
 
 #[test]
