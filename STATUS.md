@@ -3,8 +3,9 @@
 Updated: 2026-09-03
 Milestone: SV0-B4 reusable coupled verification + GX-D1 initial-condition
 projection + E6 transactional block-linear composition + W7 batch P / SC-W1
-(`CoupledSystemOperator` N-leaf DAE composition with Newton inside BDF, the SV7-F2
-coupling graph, content-addressed `BlockLinearExecution` steady-runner target)
+(`CoupledSystemOperator` N-leaf DAE composition with Newton inside BDF, Newton-Krylov and
+partitioned solver hooks, Finitum `ReducedSystemOperator` leaves, the SV7-F2 coupling graph,
+content-addressed `BlockLinearExecution` steady-runner target)
 
 ## Implemented
 
@@ -110,6 +111,23 @@ coupling graph, content-addressed `BlockLinearExecution` steady-runner target)
   dense-Newton BDF2 trajectory of the composed network to 1e-10 and the manufactured solution to
   the same discretization error, and a hopeless solver rolls the transaction back to the exact
   prior checkpoint. 55 tests at this head.
+- W7 batch P item 3 closed against Finitum `4a6fe65` (this commit):
+  `CoupledLeaf::reduced_system(name, finitum::ReducedSystemOperator)` is the leaf over Finitum's
+  state-dependent, rate-capable system operator (`SystemRealizationPlan` -> `bind_kernels` ->
+  `reduced`), which implements `methodus::DaeOperator` itself; the leaf's layout is
+  `block_state_layout`'s with block ids prefixed `<name>/` (two Finitum leaves share one composed
+  layout), its identity is `OperatorIdentity::content_identity` (`finitum-reduced-system:` plan
+  digest + constraint set), and no row-kind mask is assumed (`with_row_kinds`). `CoupledLeaf::
+  with_binding` re-keys a leaf to system-level ids: a second instance of one model repeats its
+  per-model `SymbolId`, which `CoupledSystemOperator::new` refuses until it is rebound (the
+  `SysVarId` re-key is Finitum's SC-W1 item; until then the caller supplies the offset).
+  `tests/coupled_finitum_system.rs` (3 tests): two instances of a transient heat model on two
+  meshes with a one-way sampled exchange edge -- composed residual = Finitum leaf residuals +
+  edge and `verify_dae_jvp`; five BDF1 steps through `CoupledExecution<CoupledSystemOperator>`
+  reproduce each instance's standalone Methodus trajectory when uncoupled (1e-10), heat the cold
+  instance when coupled with walls still eliminated, agree between the dense and Newton-Krylov
+  hooks (1e-9), and refuse a checkpoint restore across edge sets; binding/duplicate-id
+  refusals. 58 tests at this head.
 
 ## Boundary
 
@@ -145,7 +163,7 @@ path dependencies (sibling repositories), so this wave formats Krasis alone:
 ```text
 cargo fmt -p krasis -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test                                              # 46 passed (SC-W1 commit); 54 passed (batch P commit); 55 passed (solver hook)
+cargo test                                              # 46 passed (SC-W1 commit); 54 passed (batch P commit); 55 passed (solver hook); 58 passed (Finitum leaf)
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
 ```
 
@@ -170,14 +188,11 @@ W7 landed (this head): the content-addressed `BlockLinearExecution` steady-runne
 (batch P item 3 / SV1-F1, SV7-F2, SV4-H1 skeleton), `CrossDialectOperator` retired,
 `SemanticId` = `SysVarId` convention. Honestly open, with what each waits on:
 
-1. **Transient composition over `SystemRealizationPlan`.** Finitum's `SystemOperator` is
-   still globally linear and rate-free (`residual(state)` = `A * state`, no time, no
-   `state_rate`); the state-dependent, rate-capable residual/JVP is the Finitum lane's batch P
-   item 2. Once it lands with the `RealizationPlan` shape (`residual(time, state, state_rate,
-   output)`, `jacobian_vector_product(time, state, state_rate, state_direction, rate_direction,
-   output)`, `digest()`, `layout()`), a Krasis `CoupledOperator`-style leaf over it is the only
-   missing piece and 08 executes monolithically through `CoupledExecution<CoupledSystemOperator>`.
-   Today a `ReducedSystemOperator` enters Krasis only through `BlockLinearExecution` (steady).
+1. **Transient composition over `SystemRealizationPlan`** -- landed on the Krasis side
+   (`CoupledLeaf::reduced_system`, Finitum `4a6fe65`). What remains is Sinbad's: 08 executing
+   monolithically from a case file through `CoupledExecution<CoupledSystemOperator>` (batch P
+   item 4), and the per-instance `SysVarId` re-key in Finitum's `BlockLayout` so the caller no
+   longer has to `with_binding` a second instance of one model.
 2. **Newton-Krylov inside BDF** -- landed (Methodus `bf9082f` `bdf_step_with` + `NonlinearSolver`;
    Krasis `attempt_step_with`). Krasis still carries no Newton loop of its own; `BdfState`/
    `StepOutcome` are unchanged so checkpoints keep their shape.
@@ -194,8 +209,10 @@ W7 landed (this head): the content-addressed `BlockLinearExecution` steady-runne
    `KrasisError::SolveDidNotConverge { algorithm, iterations }` after rollback).
 5. **Upstream (Finitum, still open, C11.8):** the P1 single-point quadrature makes the
    consistent mass matrix rank-deficient; a pure reaction leaf's BDF Newton system is singular
-   on its own. The transient composition fixtures therefore use Finitum's network DAE
-   realization; the finite-element leaves are exercised on the steady view.
+   on its own. The Finitum heat leaves in `tests/coupled_finitum_system.rs` run BDF (mass +
+   stiffness is nonsingular) without `with_consistent_initialization`, whose consistent-rate
+   solve is over the mass block alone and was not exercised on them; the composed
+   consistent-initialization test stays on the network DAE.
 6. DAE index-1 consistent initialization beyond reduced-row, and coupled event persistence --
    still only from a concrete product case. `CoupledSystemOperator` concatenates leaf events
    (`event_count`/`event_values`) but `CoupledExecution` still does not persist event records.

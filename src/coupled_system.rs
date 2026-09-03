@@ -37,7 +37,8 @@ use crate::coupled::{
     solve_consistent_state_rate_for,
 };
 use crate::{
-    BlockId, CoupledOperator, KrasisError, RowKind, StateBinding, StateBlock, StateLayout,
+    BlockId, CoupledOperator, KrasisError, OperatorIdentity, RowKind, StateBinding, StateBlock,
+    StateLayout, block_state_layout,
 };
 
 /// One realization group: a Methodus DAE operator over its own state layout, with every block
@@ -129,6 +130,65 @@ impl CoupledLeaf {
         let mut leaf = Self::new(name, Arc::new(operator), layout, binding, identity)?;
         leaf.row_kinds = row_kinds;
         Ok(leaf)
+    }
+
+    /// A leaf over Finitum's constraint-eliminated system operator (`SystemRealizationPlan` ->
+    /// `bind_kernels` -> `reduced(constraints)`), batch P's state-dependent, rate-capable
+    /// residual and JVP: `ReducedSystemOperator` implements `methodus::DaeOperator` itself, so
+    /// the leaf is that operator unchanged. Its layout is [`crate::block_state_layout`]'s (one
+    /// block per field, in Finitum's block order) with every block id prefixed `<name>/`, so
+    /// two Finitum leaves compose into one layout; its identity is the operator's
+    /// [`OperatorIdentity::content_identity`] (`finitum-reduced-system:` plan digest plus the
+    /// serialized constraint set), so a checkpoint of the composition binds to the plan content.
+    ///
+    /// The binding mirrors the layout's per-model field ids (the one-instance convention of
+    /// [`crate::SemanticId`]). A second instance of the same model repeats them; rebind it to
+    /// its system-level ids with [`Self::with_binding`] before composing, or
+    /// [`CoupledSystemOperator::new`] refuses the shared id.
+    ///
+    /// No row-kind mask is recorded: whether an unconstrained row is differential is the
+    /// system's meaning (a Stokes pressure row is algebraic), not the plan's. Record one with
+    /// [`Self::with_row_kinds`]; every constrained row is algebraic, its residual being the
+    /// constraint's own `u - value`.
+    pub fn reduced_system(
+        name: impl Into<String>,
+        operator: finitum::ReducedSystemOperator,
+    ) -> Result<Self, KrasisError> {
+        let name = name.into();
+        let (fields, field_binding) = block_state_layout(operator.operator().layout())?;
+        let prefixed = |block: &StateBlock| BlockId::new(format!("{name}/{}", block.id()));
+        let layout = StateLayout::new(
+            fields
+                .blocks()
+                .iter()
+                .map(|block| StateBlock::new(prefixed(block), block.range()))
+                .collect(),
+        )?;
+        let bindings = fields
+            .blocks()
+            .iter()
+            .map(|block| {
+                let semantic = field_binding
+                    .semantic_for(block.id())
+                    .expect("block_state_layout binds every block");
+                (semantic, prefixed(block))
+            })
+            .collect();
+        let binding = StateBinding::new(&layout, bindings)?;
+        let identity = operator.content_identity();
+        Self::new(name, Arc::new(operator), layout, binding, identity)
+    }
+
+    /// Replaces the binding, re-keying this leaf's blocks to other (system-level) semantic
+    /// ids; `binding` must name exactly the blocks of this leaf's layout.
+    pub fn with_binding(mut self, binding: StateBinding) -> Result<Self, KrasisError> {
+        let layout_blocks: BTreeSet<&BlockId> =
+            self.layout.blocks().iter().map(StateBlock::id).collect();
+        if layout_blocks != binding.blocks().collect() {
+            return Err(KrasisError::StateBindingLayoutMismatch);
+        }
+        self.binding = binding;
+        Ok(self)
     }
 
     /// Records the per-row differential/algebraic mask this leaf contributes to the composed
