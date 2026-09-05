@@ -12,8 +12,10 @@ use finitum::BlockLayout as FinitumBlockLayout;
 use crate::{BlockId, KrasisError, SemanticId, StateBinding, StateBlock, StateLayout};
 
 /// Builds a Krasis [`StateLayout`] and [`StateBinding`] from a Finitum product-space
-/// [`FinitumBlockLayout`]: one Krasis block per Finitum field block, named `field_<symbol>` and
-/// bound to that field's Scientia `SymbolId`, in the same order Finitum declared them.
+/// [`FinitumBlockLayout`]: one Krasis block per Finitum field block, named `field_<variable>`
+/// and bound to that field's system-level `SysVarId` (`FieldBlock::variable`, SC-W1: dense
+/// across every instance; the identity map `SysVarId(symbol.0)` for a one-instance layout, so
+/// nothing changes numerically there), in the same order Finitum declared them.
 pub fn block_state_layout(
     layout: &FinitumBlockLayout,
 ) -> Result<(StateLayout, StateBinding), KrasisError> {
@@ -22,7 +24,7 @@ pub fn block_state_layout(
         .iter()
         .map(|block| {
             StateBlock::new(
-                block_id(block.symbol.0),
+                block_id(block.variable.0),
                 block.offset..block.offset + block.extent,
             )
         })
@@ -31,12 +33,17 @@ pub fn block_state_layout(
     let bindings = layout
         .blocks()
         .iter()
-        .map(|block| (SemanticId::new(block.symbol.0), block_id(block.symbol.0)))
+        .map(|block| {
+            (
+                SemanticId::new(block.variable.0),
+                block_id(block.variable.0),
+            )
+        })
         .collect();
     let state_binding = StateBinding::new(&state_layout, bindings)?;
     Ok((state_layout, state_binding))
 }
 
-fn block_id(symbol: u32) -> BlockId {
-    BlockId::new(format!("field_{symbol}"))
+fn block_id(variable: u32) -> BlockId {
+    BlockId::new(format!("field_{variable}"))
 }

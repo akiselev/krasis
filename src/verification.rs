@@ -14,9 +14,13 @@ use methodus::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{CoupledExecution, EventDirection};
+use crate::{CoupledExecution, EventDirection, FinitumRealization, TransactionalOperator};
 
-pub const KRASIS_VERIFICATION_SCHEMA: &str = "krasis-verification/1";
+/// `/2` (W7): a report binds one Finitum source per realization the operator is built over
+/// (`finitum_sources`, in operator order) instead of `/1`'s single optional source, so the same
+/// checks cover a [`crate::CoupledSystemOperator`] of N Finitum-backed leaves; every other field
+/// and every verdict/number is unchanged.
+pub const KRASIS_VERIFICATION_SCHEMA: &str = "krasis-verification/2";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationBinding {
@@ -24,9 +28,19 @@ pub struct VerificationBinding {
     pub operator_identity: String,
     pub layout_identity: String,
     pub config_identity: String,
-    pub finitum_realization_identity: Option<String>,
-    pub finitum_verification: Option<VerificationReportHeader>,
+    /// One entry per bound Finitum report, in the order the [`FinitumVerificationSource`] holds
+    /// them; empty for a check over a generic Methodus operator (cross-block, strategy, event).
+    pub finitum_sources: Vec<FinitumSourceBinding>,
+    /// `Some(every bound source accepted)` for an execution check; `None` for a generic one.
     pub finitum_verification_accepted: Option<bool>,
+}
+
+/// One Finitum-owned report bound to the realization it was recomputed against.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinitumSourceBinding {
+    pub realization_identity: String,
+    pub verification: VerificationReportHeader,
+    pub accepted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Error, Serialize, Deserialize)]
@@ -36,9 +50,19 @@ pub struct VerificationRefusal {
     pub message: String,
 }
 
-/// In-process source needed to validate a durable Krasis report against Finitum-owned evidence.
+/// In-process source needed to validate a durable Krasis report against Finitum-owned evidence:
+/// one or more Finitum reports, each bound to the identity of the realization it was computed
+/// over ([`FinitumRealization::identity`]). An execution check requires every realization its
+/// operator is built over ([`TransactionalOperator::realizations`]) to be covered by at least one
+/// report (a multi-field leaf may carry one nodal patch per field), and every report to name one
+/// of them; [`Self::compose`] joins per-leaf sources for an N-leaf composition.
 #[derive(Debug)]
 pub struct FinitumVerificationSource {
+    entries: Vec<FinitumSourceEntry>,
+}
+
+#[derive(Debug)]
+struct FinitumSourceEntry {
     realization_identity: String,
     report: FinitumReport,
 }
@@ -50,6 +74,8 @@ enum FinitumReport {
 }
 
 impl FinitumVerificationSource {
+    /// Assembly-based realization agreement: single-model `RealizationPlan` evidence only (the
+    /// system path has no Finitum counterpart yet), so it binds to a [`FinitumRealization::Plan`].
     pub fn from_realization_agreement(
         report: &RealizationAgreementReport,
         realization: &RealizationPlan,
@@ -57,19 +83,25 @@ impl FinitumVerificationSource {
         report
             .validate(realization)
             .map_err(finitum_source_refusal)?;
-        Ok(Self {
-            realization_identity: finitum_realization_identity(realization),
-            report: FinitumReport::RealizationAgreement(report.clone()),
-        })
+        Ok(Self::single(
+            FinitumRealization::Plan(realization).identity(),
+            FinitumReport::RealizationAgreement(report.clone()),
+        ))
     }
 
-    pub fn check_patch(
-        realization: &RealizationPlan,
+    /// A nodal patch comparison over the realization's mesh, for a single-model plan
+    /// (`&RealizationPlan`) or a Finitum reduced system operator (`&ReducedSystemOperator`)
+    /// alike; `nodal_values` are one field's vertex-major values with `component_count`
+    /// components (a multi-field leaf takes one patch per field, composed with
+    /// [`Self::compose`]).
+    pub fn check_patch<'a>(
+        realization: impl Into<FinitumRealization<'a>>,
         component_count: usize,
         nodal_values: &[f64],
         tolerance: methodus::ComparisonTolerance,
         exact: impl FnMut(&[f64]) -> Vec<f64>,
     ) -> Result<Self, VerificationRefusal> {
+        let realization = realization.into();
         let report = finitum::check_nodal_patch(
             realization.mesh(),
             component_count,
@@ -78,35 +110,112 @@ impl FinitumVerificationSource {
             exact,
         )
         .map_err(finitum_source_refusal)?;
-        Ok(Self {
-            realization_identity: finitum_realization_identity(realization),
-            report: FinitumReport::Patch(report),
-        })
+        Ok(Self::single(
+            realization.identity(),
+            FinitumReport::Patch(report),
+        ))
     }
 
+    /// Joins sources in the given order (one per leaf, or one per field of a leaf).
+    pub fn compose(sources: impl IntoIterator<Item = Self>) -> Self {
+        Self {
+            entries: sources
+                .into_iter()
+                .flat_map(|source| source.entries)
+                .collect(),
+        }
+    }
+
+    /// The realization identities this source is bound to, in entry order.
+    pub fn realization_identities(&self) -> impl Iterator<Item = &str> {
+        self.entries
+            .iter()
+            .map(|entry| entry.realization_identity.as_str())
+    }
+
+    fn single(realization_identity: String, report: FinitumReport) -> Self {
+        Self {
+            entries: vec![FinitumSourceEntry {
+                realization_identity,
+                report,
+            }],
+        }
+    }
+
+    /// Recomputes every bound report against the realization it names among `realizations`,
+    /// refusing an entry bound elsewhere, a realization no entry covers, or assembly-based
+    /// evidence over a reduced system operator; returns the per-entry bindings and whether all
+    /// were accepted.
+    fn validate_for(
+        &self,
+        realizations: &[FinitumRealization<'_>],
+    ) -> Result<(Vec<FinitumSourceBinding>, bool), VerificationRefusal> {
+        if realizations.is_empty() {
+            return Err(refusal(
+                "KRASIS_VERIFY_FINITUM_SOURCE",
+                "the operator is built over no Finitum realization for evidence to bind to",
+            ));
+        }
+        let identities = realizations
+            .iter()
+            .map(FinitumRealization::identity)
+            .collect::<Vec<_>>();
+        let mut covered = vec![false; realizations.len()];
+        let mut bindings = Vec::with_capacity(self.entries.len());
+        let mut all_accepted = true;
+        for entry in &self.entries {
+            let Some(index) = identities
+                .iter()
+                .position(|identity| *identity == entry.realization_identity)
+            else {
+                return Err(refusal(
+                    "KRASIS_VERIFY_FINITUM_SOURCE",
+                    "Finitum evidence was bound to a different realization identity",
+                ));
+            };
+            covered[index] = true;
+            let accepted = match (&entry.report, realizations[index]) {
+                (FinitumReport::RealizationAgreement(report), FinitumRealization::Plan(plan)) => {
+                    report.validate(plan).map(|validated| validated.accepted)
+                }
+                (FinitumReport::RealizationAgreement(_), FinitumRealization::ReducedSystem(_)) => {
+                    return Err(refusal(
+                        "KRASIS_VERIFY_FINITUM_SOURCE",
+                        "assembly-based realization agreement is single-model evidence; a \
+                         reduced system operator binds nodal-patch evidence",
+                    ));
+                }
+                (FinitumReport::Patch(report), realization) => report
+                    .validate(realization.mesh())
+                    .map(|validated| validated.accepted),
+            }
+            .map_err(finitum_source_refusal)?;
+            all_accepted &= accepted;
+            bindings.push(FinitumSourceBinding {
+                realization_identity: entry.realization_identity.clone(),
+                verification: entry.header().clone(),
+                accepted,
+            });
+        }
+        if let Some(index) = covered.iter().position(|covered| !covered) {
+            return Err(refusal(
+                "KRASIS_VERIFY_FINITUM_SOURCE",
+                format!(
+                    "no Finitum evidence is bound to realization `{}`",
+                    identities[index]
+                ),
+            ));
+        }
+        Ok((bindings, all_accepted))
+    }
+}
+
+impl FinitumSourceEntry {
     fn header(&self) -> &VerificationReportHeader {
         match &self.report {
             FinitumReport::RealizationAgreement(report) => &report.header,
             FinitumReport::Patch(report) => &report.header,
         }
-    }
-
-    fn validate_for(&self, realization: &RealizationPlan) -> Result<bool, VerificationRefusal> {
-        if self.realization_identity != finitum_realization_identity(realization) {
-            return Err(refusal(
-                "KRASIS_VERIFY_FINITUM_SOURCE",
-                "Finitum evidence was bound to a different realization identity",
-            ));
-        }
-        match &self.report {
-            FinitumReport::RealizationAgreement(report) => report
-                .validate(realization)
-                .map(|validated| validated.accepted),
-            FinitumReport::Patch(report) => report
-                .validate(realization.mesh())
-                .map(|validated| validated.accepted),
-        }
-        .map_err(finitum_source_refusal)
     }
 }
 
@@ -238,9 +347,9 @@ pub struct EventStateReport {
 }
 
 impl RollbackIdentityReport {
-    pub fn validate(
+    pub fn validate<Op: TransactionalOperator>(
         &self,
-        execution: &CoupledExecution,
+        execution: &CoupledExecution<Op>,
         context: &EvaluationContext,
         step: f64,
         config: &BdfConfig,
@@ -256,9 +365,9 @@ impl RollbackIdentityReport {
 
 impl RestartTrajectoryReport {
     #[allow(clippy::too_many_arguments)]
-    pub fn validate(
+    pub fn validate<Op: TransactionalOperator>(
         &self,
-        execution: &CoupledExecution,
+        execution: &CoupledExecution<Op>,
         context: &EvaluationContext,
         step: f64,
         total_steps: usize,
@@ -340,9 +449,9 @@ impl StrategyWorkReport {
 
 impl HistoryReport {
     #[allow(clippy::too_many_arguments)]
-    pub fn validate(
+    pub fn validate<Op: TransactionalOperator>(
         &self,
-        execution: &CoupledExecution,
+        execution: &CoupledExecution<Op>,
         context: &EvaluationContext,
         step: f64,
         accepted_steps: usize,
@@ -410,8 +519,12 @@ impl EventStateReport {
     }
 }
 
-pub fn check_rollback_identity(
-    execution: &CoupledExecution,
+/// Byte-exact rollback of a rejected (or failed) BDF attempt, over any [`TransactionalOperator`]:
+/// a single realization or an N-leaf composition. Note that a still-fresh execution has no BDF
+/// history, so its first attempt cannot be rejected on an error estimate; prime one accepted
+/// step first when `config` is meant to reject.
+pub fn check_rollback_identity<Op: TransactionalOperator>(
+    execution: &CoupledExecution<Op>,
     context: &EvaluationContext,
     step: f64,
     config: &BdfConfig,
@@ -444,8 +557,9 @@ pub fn check_rollback_identity(
     Ok(report)
 }
 
-pub fn check_restart_trajectory(
-    execution: &CoupledExecution,
+#[allow(clippy::too_many_arguments)]
+pub fn check_restart_trajectory<Op: TransactionalOperator>(
+    execution: &CoupledExecution<Op>,
     context: &EvaluationContext,
     step: f64,
     total_steps: usize,
@@ -730,8 +844,9 @@ pub fn check_strategy_work<O: BlockNonlinearOperator + ?Sized>(
     Ok(report)
 }
 
-pub fn check_history_and_rejection(
-    execution: &CoupledExecution,
+#[allow(clippy::too_many_arguments)]
+pub fn check_history_and_rejection<Op: TransactionalOperator>(
+    execution: &CoupledExecution<Op>,
     context: &EvaluationContext,
     step: f64,
     accepted_steps: usize,
@@ -841,8 +956,7 @@ pub fn check_event_state_from<O: DaeOperator + ?Sized>(
         operator_identity: require_identity(operator_identity, "operator")?,
         layout_identity: format!("generic-dae-dimension/1:{}", operator.dimension()),
         config_identity: identity(&(context, &state, step, config))?,
-        finitum_realization_identity: None,
-        finitum_verification: None,
+        finitum_sources: Vec::new(),
         finitum_verification_accepted: None,
     };
     let before = serde_json::to_vec(&state).map_err(serialization_refusal)?;
@@ -964,21 +1078,21 @@ impl<O: BlockNonlinearOperator + ?Sized> BlockNonlinearOperator for CountedOpera
     }
 }
 
-fn execution_binding<T: Serialize>(
-    execution: &CoupledExecution,
+fn execution_binding<Op: TransactionalOperator, T: Serialize>(
+    execution: &CoupledExecution<Op>,
     context: &EvaluationContext,
     config: &T,
     finitum_verification: &FinitumVerificationSource,
 ) -> Result<VerificationBinding, VerificationRefusal> {
     validate_execution_identity_source(execution)?;
-    let accepted = finitum_verification.validate_for(execution.operator().realization())?;
+    let (finitum_sources, accepted) =
+        finitum_verification.validate_for(&execution.operator().realizations())?;
     Ok(VerificationBinding {
         schema: KRASIS_VERIFICATION_SCHEMA.into(),
         operator_identity: execution.operator().identity().to_owned(),
         layout_identity: execution.state().layout().identity().to_owned(),
         config_identity: identity(&(context, config))?,
-        finitum_realization_identity: Some(finitum_verification.realization_identity.clone()),
-        finitum_verification: Some(finitum_verification.header().clone()),
+        finitum_sources,
         finitum_verification_accepted: Some(accepted),
     })
 }
@@ -994,8 +1108,7 @@ fn generic_binding<T: Serialize>(
         operator_identity: require_identity(operator_identity, "operator")?,
         layout_identity: identity(layout)?,
         config_identity: identity(&(context, config))?,
-        finitum_realization_identity: None,
-        finitum_verification: None,
+        finitum_sources: Vec::new(),
         finitum_verification_accepted: None,
     })
 }
@@ -1060,8 +1173,8 @@ fn validate_identity_float(label: &str, value: f64) -> Result<(), VerificationRe
     Ok(())
 }
 
-fn accept_step(
-    execution: &mut CoupledExecution,
+fn accept_step<Op: TransactionalOperator>(
+    execution: &mut CoupledExecution<Op>,
     context: &EvaluationContext,
     step: f64,
     config: &BdfConfig,
@@ -1076,19 +1189,23 @@ fn accept_step(
     }
 }
 
-fn checkpoint_bytes(execution: &CoupledExecution) -> Result<Vec<u8>, VerificationRefusal> {
+fn checkpoint_bytes<Op: TransactionalOperator>(
+    execution: &CoupledExecution<Op>,
+) -> Result<Vec<u8>, VerificationRefusal> {
+    validate_execution_identity_source(execution)?;
     let checkpoint = execution.checkpoint().map_err(krasis_refusal)?;
-    validate_coupled_checkpoint_identity(&checkpoint)?;
-    validate_realization_identity_source(execution.operator().realization())?;
     serde_json::to_vec(&checkpoint).map_err(serialization_refusal)
 }
 
-fn validate_execution_identity_source(
-    execution: &CoupledExecution,
+fn validate_execution_identity_source<Op: TransactionalOperator>(
+    execution: &CoupledExecution<Op>,
 ) -> Result<(), VerificationRefusal> {
     let checkpoint = execution.checkpoint().map_err(krasis_refusal)?;
     validate_coupled_checkpoint_identity(&checkpoint)?;
-    validate_realization_identity_source(execution.operator().realization())
+    for realization in execution.operator().realizations() {
+        validate_realization_identity_source(realization)?;
+    }
+    Ok(())
 }
 
 fn validate_coupled_checkpoint_identity(
@@ -1112,9 +1229,29 @@ fn validate_coupled_checkpoint_identity(
     validate_bdf_state_identity(&checkpoint.integrator)
 }
 
+/// Identity-bearing Finitum values checked finite and positive-zero canonical before hashing: a
+/// plan's exposed mesh, element, constraints and stored inputs; a reduced system operator's mesh
+/// and constraint set (its quadrature and bound closures are Finitum-internal and enter only
+/// through the content digest).
 fn validate_realization_identity_source(
-    realization: &RealizationPlan,
+    realization: FinitumRealization<'_>,
 ) -> Result<(), VerificationRefusal> {
+    let realization = match realization {
+        FinitumRealization::Plan(plan) => plan,
+        FinitumRealization::ReducedSystem(reduced) => {
+            let mesh = reduced.operator().plan().mesh();
+            for (vertex, coordinates) in mesh.vertices().iter().enumerate() {
+                validate_float_slice(&format!("realization mesh vertex {vertex}"), coordinates)?;
+            }
+            for constraint in reduced.constraints().constraints() {
+                validate_identity_float("realization constraint offset", constraint.offset)?;
+                for dependency in &constraint.dependencies {
+                    validate_identity_float("realization constraint weight", dependency.weight)?;
+                }
+            }
+            return Ok(());
+        }
+    };
     let artifact = realization.artifact();
     for (vertex, coordinates) in artifact.mesh.vertices().iter().enumerate() {
         validate_float_slice(&format!("realization mesh vertex {vertex}"), coordinates)?;
@@ -1180,14 +1317,6 @@ fn require_report<T: PartialEq>(
         ));
     }
     Ok(ValidatedKrasisVerification { accepted })
-}
-
-fn finitum_realization_identity(realization: &RealizationPlan) -> String {
-    format!(
-        "{}:{}",
-        realization.digest().algorithm,
-        realization.digest().hex
-    )
 }
 
 fn finitum_source_refusal(error: finitum::FinitumError) -> VerificationRefusal {

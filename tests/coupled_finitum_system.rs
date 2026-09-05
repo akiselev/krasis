@@ -14,16 +14,18 @@ use std::collections::BTreeMap;
 
 use finitum::{
     BlockLayout, FieldSource, MeshProfile, PointEvaluation, ReducedSystemOperator, RegionMap,
-    RegionTagId, SystemConstitutiveInput, SystemEssentialConstraintRequirement,
+    RegionTagId, SysVarId, SystemConstitutiveInput, SystemEssentialConstraintRequirement,
     SystemRealizationPlan, TaggedMesh, essential_constraints_from_system, realize,
 };
 use krasis::{
-    BlockId, CoupledExecution, CoupledLeaf, CoupledSystemOperator, CouplingArgument, CouplingEdge,
-    FieldId, KrasisError, RowKind, SemanticId, SimulationState, StateBinding,
+    AttemptDisposition, BlockId, CoupledExecution, CoupledLeaf, CoupledSystemOperator,
+    CouplingArgument, CouplingEdge, FieldId, FinitumVerificationSource, KrasisError,
+    OperatorIdentity, RowKind, SemanticId, SimulationState, StateBinding, block_state_layout,
+    check_history_and_rejection, check_restart_trajectory, check_rollback_identity,
 };
 use methodus::{
-    BdfConfig, BdfOrder, BdfState, CsrMatrix, DaeOperator, EvaluationContext, ForcingPolicy,
-    GmresConfig, KrylovMethod, NewtonConfig, NewtonKrylovConfig, NewtonKrylovSolver,
+    BdfConfig, BdfOrder, BdfState, ComparisonTolerance, CsrMatrix, DaeOperator, EvaluationContext,
+    ForcingPolicy, GmresConfig, KrylovMethod, NewtonConfig, NewtonKrylovConfig, NewtonKrylovSolver,
     NonlinearSolver, StepOutcome, bdf_step, verify_dae_jvp,
 };
 use quantitas::UnitRegistry;
@@ -619,5 +621,254 @@ fn a_reduced_system_leaf_refuses_a_binding_over_other_blocks() {
     assert!(
         matches!(error, KrasisError::StateBindingDuplicateSemanticId(_)),
         "{error:?}"
+    );
+}
+
+fn bump(point: &[f64]) -> Vec<f64> {
+    vec![(std::f64::consts::PI * point[0]).sin() * (std::f64::consts::PI * point[1]).sin()]
+}
+
+/// BDF2 with tolerances no step can meet, for the forced rejection after one primed step.
+fn rejecting_config(step: f64) -> BdfConfig {
+    BdfConfig {
+        order: BdfOrder::Two,
+        absolute_tolerance: 1.0e-16,
+        relative_tolerance: 1.0e-16,
+        minimum_step: 1.0e-8,
+        maximum_step: step,
+        newton: fixed_step_config(step).newton,
+    }
+}
+
+/// One nodal patch per leaf over that leaf's own mesh and state slice, composed into one source.
+fn patch_sources(
+    fixture: &Fixture,
+    values: &[f64],
+    cold_exact: impl Fn(&[f64]) -> Vec<f64>,
+) -> (FinitumVerificationSource, FinitumVerificationSource) {
+    let tolerance = ComparisonTolerance {
+        absolute: 1.0e-12,
+        relative: 1.0e-12,
+    };
+    let hot = FinitumVerificationSource::check_patch(
+        &fixture.hot.reduced,
+        1,
+        &values[fixture.operator.leaf_range(0).unwrap()],
+        tolerance,
+        bump,
+    )
+    .unwrap();
+    let cold = FinitumVerificationSource::check_patch(
+        &fixture.cold.reduced,
+        1,
+        &values[fixture.operator.leaf_range(1).unwrap()],
+        tolerance,
+        cold_exact,
+    )
+    .unwrap();
+    (hot, cold)
+}
+
+/// W7 (2026-09-05): the FC7 sources over two `reduced_system` leaves on two meshes -- one
+/// Finitum patch per leaf composed into one source; rollback of a forced rejection is bit-exact,
+/// a split/restart reproduces the continuous trajectory bit for bit, history stays synchronized,
+/// and a source covering only one leaf (or bound to a failed patch) is refused / not accepted.
+#[test]
+fn fc7_sources_over_two_reduced_system_leaves_roll_back_and_restart_bit_exactly() {
+    let compiled = compile();
+    let fixture = two_heat_leaves(&compiled, 0.5);
+    let context = EvaluationContext::reproducible();
+    let execution =
+        CoupledExecution::new(fixture.operator.clone(), initial_state(&fixture), &context).unwrap();
+    let config = fixed_step_config(STEP);
+    let rejecting = rejecting_config(STEP);
+    let values = execution.integrator().values.clone();
+    let (hot, cold) = patch_sources(&fixture, &values, |_| vec![0.0]);
+    assert_eq!(
+        hot.realization_identities().collect::<Vec<_>>(),
+        vec![fixture.hot.reduced.content_identity()]
+    );
+
+    // Evidence over the hot leaf alone leaves the cold realization uncovered.
+    let refusal =
+        check_restart_trajectory(&execution, &context, STEP, 4, 2, &config, &hot).unwrap_err();
+    assert_eq!(refusal.code, "KRASIS_VERIFY_FINITUM_SOURCE");
+    assert!(
+        refusal
+            .message
+            .contains(&fixture.cold.reduced.content_identity())
+    );
+
+    let source = FinitumVerificationSource::compose([hot, cold]);
+    let restart =
+        check_restart_trajectory(&execution, &context, STEP, 4, 2, &config, &source).unwrap();
+    assert!(restart.passed, "{restart:#?}");
+    assert_eq!(restart.trajectory_l_infinity, 0.0);
+    assert_eq!(restart.trajectory_l2_time, 0.0);
+    assert!(restart.final_checkpoint_byte_identical);
+    assert_eq!(restart.binding.schema, "krasis-verification/2");
+    assert_eq!(
+        restart
+            .binding
+            .finitum_sources
+            .iter()
+            .map(|source| source.realization_identity.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            fixture.hot.reduced.content_identity(),
+            fixture.cold.reduced.content_identity()
+        ]
+    );
+    assert!(restart.binding.finitum_sources.iter().all(|s| s.accepted));
+    assert!(
+        restart
+            .validate(&execution, &context, STEP, 4, 2, &config, &source)
+            .unwrap()
+            .accepted
+    );
+
+    let mut primed = execution.clone();
+    let outcome = primed.attempt_step(&context, STEP, &config).unwrap();
+    assert!(matches!(outcome, StepOutcome::Accepted(_)));
+    let rollback = check_rollback_identity(&primed, &context, STEP, &rejecting, &source).unwrap();
+    assert!(rollback.passed, "{rollback:#?}");
+    assert_eq!(rollback.disposition, AttemptDisposition::Rejected);
+    assert!(rollback.byte_identical);
+    assert_eq!(
+        rollback.checkpoint_before_digest,
+        rollback.checkpoint_after_digest
+    );
+
+    let history =
+        check_history_and_rejection(&execution, &context, STEP, 2, &config, &rejecting, &source)
+            .unwrap();
+    assert!(history.passed, "{history:#?}");
+    assert!(history.synchronized);
+    assert_eq!(history.rejected_attempt, AttemptDisposition::Rejected);
+    assert!(history.rejection_byte_identical);
+    let mut depths = history.field_history_depths.clone();
+    depths.sort();
+    let mut expected = fixture
+        .operator
+        .layout()
+        .blocks()
+        .iter()
+        .map(|block| (block.id().to_string(), 2))
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(depths, expected);
+
+    // A failed cold patch is recomputed as not accepted and fails the report without refusing.
+    let (hot, failed_cold) = patch_sources(&fixture, &values, |_| vec![1.0]);
+    let failed = FinitumVerificationSource::compose([hot, failed_cold]);
+    let not_accepted =
+        check_rollback_identity(&primed, &context, STEP, &rejecting, &failed).unwrap();
+    assert_eq!(
+        not_accepted.binding.finitum_verification_accepted,
+        Some(false)
+    );
+    assert!(not_accepted.binding.finitum_sources[0].accepted);
+    assert!(!not_accepted.binding.finitum_sources[1].accepted);
+    assert!(!not_accepted.passed);
+    assert!(not_accepted.byte_identical);
+}
+
+/// W7 (2026-09-05): `CoupledSystemOperator::initial_state_from` projects each leaf's bound
+/// `FieldSource`s over that leaf's own mesh (`NodalContext` per leaf), reproducing the fixture's
+/// hand-assembled initial state bitwise, and refuses a missing or unknown block typed.
+#[test]
+fn initial_state_from_projects_onto_each_leaf_mesh() {
+    let compiled = compile();
+    let fixture = two_heat_leaves(&compiled, 0.0);
+    let layout = fixture.operator.layout();
+    assert_eq!(layout.blocks().len(), 2);
+    let bindings = layout
+        .blocks()
+        .iter()
+        .map(|block| {
+            let source = if block.id().as_str().starts_with("hot/") {
+                FieldSource::sampled(bump)
+            } else {
+                FieldSource::constant([0.0])
+            };
+            (block.id().clone(), source)
+        })
+        .collect::<Vec<_>>();
+    let state = fixture.operator.initial_state_from(4, &bindings).unwrap();
+    assert_eq!(state.committed_vector().unwrap(), initial_values(&fixture));
+    assert_eq!(
+        state.committed_vector().unwrap(),
+        initial_state(&fixture).committed_vector().unwrap()
+    );
+    let context = EvaluationContext::reproducible();
+    let execution = CoupledExecution::new(fixture.operator.clone(), state, &context).unwrap();
+    assert_eq!(
+        execution.checkpoint().unwrap(),
+        CoupledExecution::new(fixture.operator.clone(), initial_state(&fixture), &context)
+            .unwrap()
+            .checkpoint()
+            .unwrap()
+    );
+
+    let missing = fixture
+        .operator
+        .initial_state_from(4, &bindings[..1])
+        .unwrap_err();
+    assert!(
+        matches!(missing, KrasisError::InitialBlockMissing(_)),
+        "{missing}"
+    );
+    let mut unknown = bindings.clone();
+    unknown.push((BlockId::new("warm/field_0"), FieldSource::constant([0.0])));
+    let unknown = fixture
+        .operator
+        .initial_state_from(4, &unknown)
+        .unwrap_err();
+    assert!(
+        matches!(unknown, KrasisError::InitialBlockUnknown(_)),
+        "{unknown}"
+    );
+}
+
+/// W7 (2026-09-05, HANDOFF §6 Krasis item): `block_state_layout` reads `FieldBlock::variable`
+/// (the system-level `SysVarId`), not the per-model `SymbolId`, so a layout Finitum keys for a
+/// second instance binds its blocks to dense system ids without `CoupledLeaf::with_binding`.
+/// The honest boundary: Finitum's `SystemRealizationPlan::new` still accepts only the
+/// one-instance identity keying, so a second instance of one model cannot yet be realized with
+/// its own `SysVarId`s and the fixture's caller-side `with_binding` stays until it can.
+#[test]
+fn block_state_layout_binds_the_system_variable_and_finitum_still_refuses_a_keyed_plan() {
+    let compiled = compile();
+    let field = symbol(&compiled.model, "u");
+    let keyed = BlockLayout::new_keyed([(SysVarId(field.0 + SECOND_INSTANCE_OFFSET), field, 9, 1)])
+        .unwrap();
+    let (layout, binding) = block_state_layout(&keyed).unwrap();
+    let block = BlockId::new(format!("field_{}", field.0 + SECOND_INSTANCE_OFFSET));
+    assert_eq!(layout.blocks()[0].id(), &block);
+    assert_eq!(
+        binding.semantic_for(&block),
+        Some(SemanticId::new(field.0 + SECOND_INSTANCE_OFFSET))
+    );
+    let identity = BlockLayout::new([(field, 9, 1)]).unwrap();
+    let (identity_layout, identity_binding) = block_state_layout(&identity).unwrap();
+    assert_eq!(
+        identity_layout.blocks()[0].id(),
+        &BlockId::new(format!("field_{}", field.0))
+    );
+    assert_eq!(
+        identity_binding.semantic_for(identity_layout.blocks()[0].id()),
+        Some(SemanticId::new(field.0))
+    );
+
+    let tagged = realize(&MeshProfile::SimplexBox {
+        dimension: 2,
+        extent: vec![[0.0, 1.0], [0.0, 1.0]],
+        subdivisions: vec![2, 2],
+    })
+    .unwrap();
+    let refused = SystemRealizationPlan::new(compiled.system.clone(), tagged.mesh.clone(), keyed);
+    assert!(
+        refused.is_err(),
+        "Finitum accepted a keyed one-instance plan"
     );
 }

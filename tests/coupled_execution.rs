@@ -164,12 +164,20 @@ fn sv0_transaction_restart_and_history_reports_are_identity_bound() {
     );
     assert!(!restart.binding.layout_identity.is_empty());
     assert!(restart.binding.config_identity.starts_with("blake3:"));
+    assert_eq!(restart.binding.schema, "krasis-verification/2");
+    assert_eq!(restart.binding.finitum_sources.len(), 1);
+    assert_eq!(
+        restart.binding.finitum_sources[0].realization_identity,
+        format!(
+            "{}:{}",
+            execution.operator().realization().digest().algorithm,
+            execution.operator().realization().digest().hex
+        )
+    );
+    assert!(restart.binding.finitum_sources[0].accepted);
     assert!(
-        restart
-            .binding
-            .finitum_verification
-            .as_ref()
-            .unwrap()
+        restart.binding.finitum_sources[0]
+            .verification
             .report_digest
             .hex
             .len()

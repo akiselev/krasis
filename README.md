@@ -30,6 +30,10 @@ bind it to the exact realization identity, source-validate its body against that
 its mesh, and retain its typed header and acceptance without duplicating the Finitum schema. The
 current adapters cover realization agreement and nodal-patch reports; state-dependent
 realizations may use the latter when Finitum truthfully refuses partial-assembly agreement.
+These checks run over any transactional operator (W7, `krasis-verification/2`): a report binds
+one Finitum source per realization the operator is built over, so an N-leaf composition over
+Finitum reduced system operators carries one nodal patch per leaf, and an execution whose
+realizations are not all covered is refused rather than partially bound.
 Identity-bearing floating-point inputs must be finite. Positive zero is canonical; negative zero
 is refused instead of being collapsed by JSON encoding. Solver-error rollback evidence therefore
 uses finite, structurally invalid solver policy rather than a nonfinite sentinel.

@@ -26,6 +26,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
+use finitum::FieldSource;
 use methodus::{
     BlockLayout as SolverBlockLayout, BlockNonlinearOperator, BlockSpec, DaeOperator,
     EvaluationContext, LinearOperator, NewtonConfig, NonlinearOperator, NumericError,
@@ -33,12 +34,12 @@ use methodus::{
 use serde::{Deserialize, Serialize};
 
 use crate::coupled::{
-    ConsistentInitialization, TransactionalOperator, consistent_initialization_identity,
-    solve_consistent_state_rate_for,
+    ConsistentInitialization, FinitumRealization, TransactionalOperator,
+    consistent_initialization_identity, solve_consistent_state_rate_for,
 };
 use crate::{
-    BlockId, CoupledOperator, KrasisError, OperatorIdentity, RowKind, StateBinding, StateBlock,
-    StateLayout, block_state_layout,
+    BlockId, CoupledOperator, FieldId, KrasisError, NodalContext, OperatorIdentity, RowKind,
+    SimulationState, StateBinding, StateBlock, StateLayout, block_state_layout, initial_state_from,
 };
 
 /// One realization group: a Methodus DAE operator over its own state layout, with every block
@@ -47,10 +48,20 @@ use crate::{
 pub struct CoupledLeaf {
     name: String,
     operator: Arc<dyn DaeOperator>,
+    source: LeafSource,
     layout: StateLayout,
     binding: StateBinding,
     row_kinds: Option<Vec<RowKind>>,
     identity: String,
+}
+
+/// The typed Finitum realization behind a leaf's erased operator, kept so verification evidence
+/// and initial-condition projection reach the plan or mesh it was built over.
+#[derive(Clone)]
+enum LeafSource {
+    Opaque,
+    Realization(Arc<CoupledOperator>),
+    ReducedSystem(Arc<finitum::ReducedSystemOperator>),
 }
 
 impl fmt::Debug for CoupledLeaf {
@@ -99,6 +110,7 @@ impl CoupledLeaf {
         Ok(Self {
             name,
             operator,
+            source: LeafSource::Opaque,
             layout,
             binding,
             row_kinds: None,
@@ -127,7 +139,10 @@ impl CoupledLeaf {
         }
         let row_kinds = operator.row_kinds().map(<[RowKind]>::to_vec);
         let identity = operator.identity().to_owned();
-        let mut leaf = Self::new(name, Arc::new(operator), layout, binding, identity)?;
+        let typed = Arc::new(operator);
+        let erased: Arc<dyn DaeOperator> = typed.clone();
+        let mut leaf = Self::new(name, erased, layout, binding, identity)?;
+        leaf.source = LeafSource::Realization(typed);
         leaf.row_kinds = row_kinds;
         Ok(leaf)
     }
@@ -176,7 +191,23 @@ impl CoupledLeaf {
             .collect();
         let binding = StateBinding::new(&layout, bindings)?;
         let identity = operator.content_identity();
-        Self::new(name, Arc::new(operator), layout, binding, identity)
+        let typed = Arc::new(operator);
+        let erased: Arc<dyn DaeOperator> = typed.clone();
+        let mut leaf = Self::new(name, erased, layout, binding, identity)?;
+        leaf.source = LeafSource::ReducedSystem(typed);
+        Ok(leaf)
+    }
+
+    /// The Finitum realization this leaf is built over ([`Self::realization`],
+    /// [`Self::reduced_system`]); `None` for a leaf over an opaque Methodus operator.
+    pub fn finitum(&self) -> Option<FinitumRealization<'_>> {
+        match &self.source {
+            LeafSource::Opaque => None,
+            LeafSource::Realization(operator) => {
+                Some(FinitumRealization::Plan(operator.realization()))
+            }
+            LeafSource::ReducedSystem(reduced) => Some(FinitumRealization::ReducedSystem(reduced)),
+        }
     }
 
     /// Replaces the binding, re-keying this leaf's blocks to other (system-level) semantic
@@ -628,6 +659,47 @@ impl CoupledSystemOperator {
         self.layout.width()
     }
 
+    /// Projects Finitum `FieldSource`s onto every leaf's P1 nodal DOF map and assembles a freshly
+    /// committed [`SimulationState`] over the composed layout: [`crate::initial_state_from`]
+    /// applied leaf by leaf, each over a [`NodalContext`] built from that leaf's own Finitum
+    /// mesh ([`CoupledLeaf::finitum`]), so two leaves on two meshes project independently.
+    /// `bindings` are keyed by the composed layout's block ids (`<leaf>/<block>`) and must name
+    /// every block exactly once; a leaf over an opaque operator is refused, having no mesh.
+    pub fn initial_state_from(
+        &self,
+        history_limit: usize,
+        bindings: &[(BlockId, FieldSource)],
+    ) -> Result<SimulationState, KrasisError> {
+        for (block, _) in bindings {
+            if self.layout.block(block).is_none() {
+                return Err(KrasisError::InitialBlockUnknown(block.to_string()));
+            }
+        }
+        let mut state = SimulationState::new(self.layout.clone(), history_limit);
+        for leaf in &self.leaves {
+            let Some(realization) = leaf.finitum() else {
+                return Err(KrasisError::InvalidCoupling(format!(
+                    "leaf `{}` is over an opaque operator and has no Finitum mesh to project \
+                     initial values onto",
+                    leaf.name
+                )));
+            };
+            let nodal = NodalContext::new(realization.mesh().vertices())?;
+            let leaf_bindings = bindings
+                .iter()
+                .filter(|(block, _)| leaf.layout.block(block).is_some())
+                .cloned()
+                .collect::<Vec<_>>();
+            let projected =
+                initial_state_from(&leaf.layout, &nodal, history_limit, &leaf_bindings)?;
+            for block in leaf.layout.blocks() {
+                let field = FieldId::new(block.id().as_str());
+                state.insert_field(field.clone(), projected.committed(&field)?.to_vec())?;
+            }
+        }
+        Ok(state)
+    }
+
     pub fn leaves(&self) -> &[CoupledLeaf] {
         &self.leaves
     }
@@ -941,5 +1013,12 @@ impl TransactionalOperator for CoupledSystemOperator {
 
     fn state_layout_identity(&self) -> &str {
         self.layout.identity()
+    }
+
+    fn realizations(&self) -> Vec<FinitumRealization<'_>> {
+        self.leaves
+            .iter()
+            .filter_map(CoupledLeaf::finitum)
+            .collect()
     }
 }

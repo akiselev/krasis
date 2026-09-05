@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use finitum::RealizationPlan;
+use finitum::{Mesh, RealizationPlan, ReducedSystemOperator};
 use methodus::{
     BdfConfig, BdfState, BlockLayout as SolverBlockLayout, BlockNonlinearOperator, BlockSpec,
     DaeOperator, EvaluationContext, NewtonConfig, NonlinearOperator, NonlinearSolver, NumericError,
@@ -36,6 +36,53 @@ pub(crate) struct ConsistentInitialization {
 pub trait TransactionalOperator: DaeOperator + Clone + std::fmt::Debug {
     fn identity(&self) -> &str;
     fn state_layout_identity(&self) -> &str;
+    /// The Finitum realizations this operator is built over, in state order: one for a
+    /// [`CoupledOperator`], one per Finitum-backed leaf of a [`crate::CoupledSystemOperator`]
+    /// (an opaque leaf contributes none). Verification evidence
+    /// ([`crate::FinitumVerificationSource`]) binds to exactly these.
+    fn realizations(&self) -> Vec<FinitumRealization<'_>>;
+}
+
+/// One Finitum realization group a [`TransactionalOperator`] is built over, as verification
+/// evidence binds to it: the single-model `RealizationPlan` that [`CoupledOperator`] wraps, or
+/// the constraint-eliminated system operator (`SystemRealizationPlan` -> `bind_kernels` ->
+/// `reduced`) that [`crate::CoupledLeaf::reduced_system`] wraps. Both expose the content
+/// identity Finitum evidence is bound to and the mesh a nodal patch validates against.
+#[derive(Clone, Copy, Debug)]
+pub enum FinitumRealization<'a> {
+    Plan(&'a RealizationPlan),
+    ReducedSystem(&'a ReducedSystemOperator),
+}
+
+impl<'a> FinitumRealization<'a> {
+    /// The identity evidence binds to: the plan's `<algorithm>:<hex>` digest, or the reduced
+    /// system operator's [`crate::OperatorIdentity::content_identity`] (`finitum-reduced-system:`
+    /// plan digest, bound constitutive closures, serialized constraint set).
+    pub fn identity(&self) -> String {
+        match self {
+            Self::Plan(plan) => format!("{}:{}", plan.digest().algorithm, plan.digest().hex),
+            Self::ReducedSystem(reduced) => crate::OperatorIdentity::content_identity(*reduced),
+        }
+    }
+
+    pub fn mesh(&self) -> &'a Mesh {
+        match self {
+            Self::Plan(plan) => plan.mesh(),
+            Self::ReducedSystem(reduced) => reduced.operator().plan().mesh(),
+        }
+    }
+}
+
+impl<'a> From<&'a RealizationPlan> for FinitumRealization<'a> {
+    fn from(plan: &'a RealizationPlan) -> Self {
+        Self::Plan(plan)
+    }
+}
+
+impl<'a> From<&'a ReducedSystemOperator> for FinitumRealization<'a> {
+    fn from(reduced: &'a ReducedSystemOperator) -> Self {
+        Self::ReducedSystem(reduced)
+    }
 }
 
 /// Krasis-owned composition of a realized Finitum action into Methodus contracts.
@@ -517,6 +564,10 @@ impl TransactionalOperator for CoupledOperator {
 
     fn state_layout_identity(&self) -> &str {
         &self.state_layout_identity
+    }
+
+    fn realizations(&self) -> Vec<FinitumRealization<'_>> {
+        vec![FinitumRealization::Plan(&self.realization)]
     }
 }
 

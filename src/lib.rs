@@ -21,7 +21,8 @@ pub use block_solve::{
 };
 pub use checkpoint::Checkpoint;
 pub use coupled::{
-    CoupledCheckpoint, CoupledExecution, CoupledOperator, RowKind, TransactionalOperator,
+    CoupledCheckpoint, CoupledExecution, CoupledOperator, FinitumRealization, RowKind,
+    TransactionalOperator,
 };
 pub use coupled_system::{
     CoupledLeaf, CoupledSystemOperator, CouplingArgument, CouplingDependency, CouplingEdge,
@@ -34,10 +35,10 @@ pub use layout::{BlockId, StateBlock, StateLayout};
 pub use state::{ConstitutiveSlot, FieldId, SimulationState, TransactionPhase};
 pub use verification::{
     AttemptDisposition, CrossBlockDerivativeCheck, CrossBlockDerivativeReport, EventDisposition,
-    EventStateReport, FinitumVerificationSource, HistoryReport, KRASIS_VERIFICATION_SCHEMA,
-    RestartTrajectoryReport, RollbackIdentityReport, StrategyAgreement, StrategyOutcome,
-    StrategyWorkReport, ValidatedKrasisVerification, VerificationBinding, VerificationRefusal,
-    check_cross_block_derivatives, check_event_state, check_event_state_from,
+    EventStateReport, FinitumSourceBinding, FinitumVerificationSource, HistoryReport,
+    KRASIS_VERIFICATION_SCHEMA, RestartTrajectoryReport, RollbackIdentityReport, StrategyAgreement,
+    StrategyOutcome, StrategyWorkReport, ValidatedKrasisVerification, VerificationBinding,
+    VerificationRefusal, check_cross_block_derivatives, check_event_state, check_event_state_from,
     check_history_and_rejection, check_restart_trajectory, check_rollback_identity,
     check_strategy_work,
 };

@@ -1,11 +1,12 @@
 # Krasis status
 
-Updated: 2026-09-03
+Updated: 2026-09-05
 Milestone: SV0-B4 reusable coupled verification + GX-D1 initial-condition
 projection + E6 transactional block-linear composition + W7 batch P / SC-W1
 (`CoupledSystemOperator` N-leaf DAE composition with Newton inside BDF, Newton-Krylov and
 partitioned solver hooks, Finitum `ReducedSystemOperator` leaves, the SV7-F2 coupling graph,
-content-addressed `BlockLinearExecution` steady-runner target)
+content-addressed `BlockLinearExecution` steady-runner target; FC7 verification sources and
+initial-state projection over `CoupledLeaf::reduced_system`)
 
 ## Implemented
 
@@ -129,6 +130,66 @@ content-addressed `BlockLinearExecution` steady-runner target)
   hooks (1e-9), and refuse a checkpoint restore across edge sets; binding/duplicate-id
   refusals. 58 tests at this head.
 
+- W7 FC7 sources over a coupled leaf (2026-09-05, the C12.6 item (c) Krasis surface for Sinbad's
+  single compile path): `check_rollback_identity`, `check_restart_trajectory`,
+  `check_history_and_rejection` and the reports' `validate` are generic over
+  `CoupledExecution<Op: TransactionalOperator>`, so the same functions run over a
+  `CoupledOperator` (one `RealizationPlan`) and over `CoupledExecution<CoupledSystemOperator>`
+  whose leaves are Finitum `ReducedSystemOperator`s. Shapes: `TransactionalOperator::
+  realizations(&self) -> Vec<FinitumRealization<'_>>` (new trait method; `FinitumRealization::
+  {Plan(&RealizationPlan), ReducedSystem(&ReducedSystemOperator)}` with `identity()` -- the plan's
+  `<algorithm>:<hex>` digest, or the reduced operator's `OperatorIdentity::content_identity`
+  (`finitum-reduced-system:<plan digest>:constraints=blake3:...`) -- and `mesh()`; `From<&
+  RealizationPlan>`/`From<&ReducedSystemOperator>`); `CoupledLeaf` keeps the typed Finitum
+  operator behind its erased `DaeOperator` (`CoupledLeaf::finitum() -> Option<FinitumRealization>`,
+  `None` for an opaque leaf), and `CoupledSystemOperator::realizations()` lists its Finitum-backed
+  leaves in order. `FinitumVerificationSource` is a set of Finitum reports each bound to one
+  realization identity: `check_patch(impl Into<FinitumRealization>, ..)` takes `&RealizationPlan`
+  (Sinbad's existing call compiles unchanged) or `&ReducedSystemOperator`;
+  `from_realization_agreement` stays plan-only (Finitum's assembly agreement is single-model,
+  C12.6 (b)); `compose(sources)` joins per-leaf (or per-field) sources;
+  `realization_identities()`. Binding: an execution check requires every realization of the
+  operator covered by >= 1 report and every report bound to one of them, else
+  `KRASIS_VERIFY_FINITUM_SOURCE` (message names the uncovered identity); assembly-based evidence
+  offered for a reduced system is refused with the same code. **Schema `krasis-verification/1`
+  -> `/2`**: `VerificationBinding { schema, operator_identity, layout_identity, config_identity,
+  finitum_sources: Vec<FinitumSourceBinding { realization_identity, verification:
+  VerificationReportHeader, accepted }>, finitum_verification_accepted: Option<bool> }` replaces
+  `/1`'s three optional single-source fields (`finitum_realization_identity`,
+  `finitum_verification`, `finitum_verification_accepted`); every verdict, digest of checkpoints,
+  norm and refusal code is unchanged, only `report_digest` values move. Identity-source
+  finiteness (`KRASIS_VERIFY_NONFINITE_IDENTITY_INPUT`/`NEGATIVE_ZERO`) is walked over every
+  realization: a plan's exposed mesh/element/constraints/stored inputs as before; a reduced
+  system's mesh vertices and constraint set (its quadrature and bound closures are
+  Finitum-internal and enter only through the content digest -- deviation recorded).
+  `CoupledSystemOperator::initial_state_from(history_limit, &[(BlockId, FieldSource)])` is
+  `initial_state_from` applied leaf by leaf over a `NodalContext` built from each leaf's own mesh
+  (bindings keyed by the composed `<leaf>/<block>` ids; opaque leaf refused `InvalidCoupling`;
+  missing/unknown block `InitialBlockMissing`/`InitialBlockUnknown`). `block_state_layout` now
+  reads `FieldBlock::variable` (`SysVarId`) instead of `symbol` -- identical for every
+  one-instance layout (`SysVarId(symbol.0)`), the dense system id for a keyed one.
+  Evidence: `tests/fc7_coupled_leaf.rs` (1 test) wraps the **02-transient-diffusion corpus
+  model** once through Sinbad's single-equation path (`RealizationPlan::new_stateful`, degree-2
+  exact P1 rule, `CoupledOperator`) and once through `SystemRealizationPlan -> bind_kernels ->
+  reduced -> CoupledLeaf::reduced_system("system") -> CoupledSystemOperator` on the same 4x4
+  mesh (25 DOFs): `initial_state_from` over one `NodalContext` gives bitwise-equal initial
+  vectors on both layouts and through `CoupledSystemOperator::initial_state_from`; four BDF2
+  steps (`dt = 0.025`) agree to max relative difference **2.8e-16** (tolerance 1e-10; the
+  arithmetic differs by quadrature rule so not bitwise); the patch source binds through the same
+  `check_patch` call; primed rollback under a rejecting BDF2 config is `Rejected` and
+  byte-identical on both; restart 4 split 2 has `l_infinity = l2_time = 0` and a byte-identical
+  final checkpoint on both, `validate` accepts and the report round-trips; history 2 +
+  rejection synchronized with equal depths; evidence crossed between the paths refuses
+  `KRASIS_VERIFY_FINITUM_SOURCE` both ways. `tests/coupled_finitum_system.rs` (+3): on the
+  two-mesh two-leaf fixture with the exchange edge, one patch per leaf composed -- a source
+  covering the hot leaf alone is refused naming the cold identity; restart bit-exact; primed
+  rollback `Rejected` and byte-identical; history synchronized (both blocks depth 2); a failing
+  cold patch yields `finitum_verification_accepted = Some(false)`, per-source `accepted`
+  `[true, false]` and `passed = false` without refusing; `initial_state_from` over both leaves'
+  meshes reproduces the hand-assembled state and checkpoint bitwise; `block_state_layout` on a
+  `BlockLayout::new_keyed` layout binds `SemanticId(SysVarId)` / `field_<variable>` and
+  `SystemRealizationPlan::new` still refuses that keyed layout. 62 tests at this head.
+
 ## Boundary
 
 Scientia owns scientific/coupling meaning, Finitum owns concrete discrete operators,
@@ -163,7 +224,7 @@ path dependencies (sibling repositories), so this wave formats Krasis alone:
 ```text
 cargo fmt -p krasis -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test                                              # 46 passed (SC-W1 commit); 54 passed (batch P commit); 55 passed (solver hook); 58 passed (Finitum leaf)
+cargo test                                              # 46 passed (SC-W1 commit); 54 passed (batch P commit); 55 passed (solver hook); 58 passed (Finitum leaf); 62 passed (FC7 over coupled leaves, 2026-09-05, per test binary in the foreground)
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
 ```
 
@@ -189,10 +250,14 @@ W7 landed (this head): the content-addressed `BlockLinearExecution` steady-runne
 `SemanticId` = `SysVarId` convention. Honestly open, with what each waits on:
 
 1. **Transient composition over `SystemRealizationPlan`** -- landed on the Krasis side
-   (`CoupledLeaf::reduced_system`, Finitum `4a6fe65`). What remains is Sinbad's: 08 executing
-   monolithically from a case file through `CoupledExecution<CoupledSystemOperator>` (batch P
-   item 4), and the per-instance `SysVarId` re-key in Finitum's `BlockLayout` so the caller no
-   longer has to `with_binding` a second instance of one model.
+   (`CoupledLeaf::reduced_system`, Finitum `4a6fe65`); 08 executes monolithically from a case
+   file in Sinbad (C12.1). The FC7 verification sources and initial-state projection now run
+   over such leaves (2026-09-05, above), which is the Krasis half of C12.6's single-compile-path
+   boundary. `CoupledLeaf::with_binding` **stays**: Krasis reads `FieldBlock::variable`, but
+   Finitum's `SystemRealizationPlan::new` accepts only the one-instance identity keying
+   (`SystemIdMap::one_instance` against the layout), so a second instance of one model cannot
+   yet be realized with its own dense `SysVarId`s and the caller still re-keys it (proven by
+   `block_state_layout_binds_the_system_variable_and_finitum_still_refuses_a_keyed_plan`).
 2. **Newton-Krylov inside BDF** -- landed (Methodus `bf9082f` `bdf_step_with` + `NonlinearSolver`;
    Krasis `attempt_step_with`). Krasis still carries no Newton loop of its own; `BdfState`/
    `StepOutcome` are unchanged so checkpoints keep their shape.
@@ -219,3 +284,25 @@ W7 landed (this head): the content-addressed `BlockLinearExecution` steady-runne
 6. DAE index-1 consistent initialization beyond reduced-row, and coupled event persistence --
    still only from a concrete product case. `CoupledSystemOperator` concatenates leaf events
    (`event_count`/`event_values`) but `CoupledExecution` still does not persist event records.
+
+## Cross-repo needs (2026-09-05)
+
+- **Finitum**: a multi-instance `SystemRealizationPlan` whose `BlockLayout::new_keyed` carries
+  dense `SysVarId`s for a second instance of one model (waits on Scientia `OperatorSystem/2`
+  per Finitum's own STATUS). Krasis already binds `FieldBlock::variable`; once such a plan
+  exists, `CoupledLeaf::with_binding` and `SECOND_INSTANCE_OFFSET` in
+  `tests/coupled_finitum_system.rs` are deleted, not kept.
+- **Finitum**: realization-agreement evidence (element/partial assembly vs matrix-free) on
+  `SystemOperator`/`ReducedSystemOperator` (C12.6 (b)); until then
+  `FinitumVerificationSource::from_realization_agreement` binds a `RealizationPlan` only and
+  the system path carries nodal-patch evidence (Sinbad's uniform choice since C11.13).
+- **Sinbad** (to consume this): the transient system runner builds its `TransientRestart`
+  evidence exactly as the single-equation runner does, over `CoupledExecution<
+  CoupledSystemOperator>`: `FinitumVerificationSource::check_patch(&reduced, components,
+  &values[field block range], tolerance, exact)` per field (compose several with
+  `FinitumVerificationSource::compose`), then `check_rollback_identity`/`check_restart_trajectory`/
+  `check_history_and_rejection` unchanged in signature; initial state through
+  `CoupledSystemOperator::initial_state_from(history, &[(BlockId("system/field_<v>"),
+  FieldSource)])` or the existing `initial_state_from(coupled.layout(), &NodalContext, ..)` when
+  every leaf shares the mesh. Recorded reports carry `krasis-verification/2` (binding shape
+  above), which changes every stored `report_digest`/execution identity of a transient case.
