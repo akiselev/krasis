@@ -58,7 +58,7 @@ impl OperatorIdentity for finitum::ReducedSystemOperator {
     fn content_identity(&self) -> String {
         format!(
             "finitum-reduced-system:{}:constraints={}",
-            self.operator().digest(),
+            self.realization_digest(),
             constraint_set_identity(self.constraints())
         )
     }

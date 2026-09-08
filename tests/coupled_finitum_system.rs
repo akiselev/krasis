@@ -873,3 +873,69 @@ fn block_state_layout_binds_the_system_variable_and_finitum_still_refuses_a_keye
         "Finitum accepted a keyed one-instance plan"
     );
 }
+
+#[test]
+fn prescribed_motion_changes_checkpoint_identity_and_static_identity_stays_exact() {
+    let fixture = heat_instance(&compile(), 2, 0.0);
+    let base = fixture.reduced;
+    let constraints_bytes = serde_json::to_vec(base.constraints()).unwrap();
+    assert_eq!(
+        base.content_identity(),
+        format!(
+            "finitum-reduced-system:{}:constraints=blake3:{}",
+            base.operator().digest(),
+            blake3::hash(&constraints_bytes).to_hex(),
+        )
+    );
+    let target = base.constraints().constraints().next().unwrap().target;
+    let coordinates = fixture.tagged.mesh.vertices()[target.0].clone();
+    let moving = |identity: &str, slope: f64| {
+        base.clone()
+            .with_prescribed_values(
+                identity,
+                vec![finitum::PrescribedEssentialValue::new(
+                    target,
+                    coordinates.clone(),
+                    finitum::InputOrigin::Slot("boundary/g".into()),
+                    move |time| {
+                        Ok(finitum::PrescribedValueAndRate {
+                            value: slope * time,
+                            rate: slope,
+                        })
+                    },
+                )],
+            )
+            .unwrap()
+    };
+    let first = moving("g=t;rate=1", 1.0);
+    let second = moving("g=2t;rate=2", 2.0);
+    assert_ne!(first.content_identity(), base.content_identity());
+    assert_ne!(first.content_identity(), second.content_identity());
+    let context = EvaluationContext::reproducible();
+    let make_execution = |reduced| {
+        let leaf = CoupledLeaf::reduced_system("body", reduced).unwrap();
+        let coupled = CoupledSystemOperator::new(vec![leaf], vec![]).unwrap();
+        let mut state = SimulationState::new(coupled.layout().clone(), 2);
+        for block in coupled.layout().blocks() {
+            state
+                .insert_field(
+                    FieldId::new(block.id().as_str()),
+                    vec![0.0; block.range().len()],
+                )
+                .unwrap();
+        }
+        CoupledExecution::new(coupled, state, &context).unwrap()
+    };
+    let source = make_execution(first.clone());
+    let checkpoint = source.checkpoint().unwrap();
+    let mut same = make_execution(first);
+    same.restore(&checkpoint).unwrap();
+    assert_eq!(same.checkpoint().unwrap(), checkpoint);
+    let mut different = make_execution(second);
+    let before = different.checkpoint().unwrap();
+    assert!(matches!(
+        different.restore(&checkpoint),
+        Err(KrasisError::InvalidCoupling(_))
+    ));
+    assert_eq!(different.checkpoint().unwrap(), before);
+}

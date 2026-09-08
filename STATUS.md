@@ -1,7 +1,7 @@
 # Krasis status
 
 Updated: 2026-09-08
-Committed base: `e1dd668bc3f00691be29a0816a7904c2ae3c41cd`.
+Committed base: `817e796` (fallible explicit-time consumer migration).
 Milestone: W8 F3 consumer migration implemented in the working tree. All retiring Finitum
 constructor calls are migrated; removal of the last `FieldSource::Sampled` match arm is
 coordinated with the producer's enum deletion.
@@ -85,6 +85,18 @@ assembly, kernel compilation or numerical solver algorithms.
 - No numerical policy, coupling algorithm, public initial-state signature or execution
   identity convention changed in this migration.
 
+## Prescribed-motion checkpoint identity (working tree)
+
+- Reduced-system content identity consumes Finitum's `realization_digest()`, covering
+  prescribed value/rate identity and target descriptors. Static identities keep their exact
+  previous bytes; no solver or integration algorithm changed.
+- The regression uses two motions with identical initial values but different analytic rates.
+  Same-motion restore succeeds; different-motion restore refuses before changing the target
+  state/checkpoint. The static identity format is asserted explicitly.
+- Full `cargo test -q -p krasis`: all 69 tests passed, none ignored. Focused regression,
+  clippy with warnings denied, rustdoc with warnings denied and scoped formatting passed.
+  Finitum prescribed-motion prerequisite is committed at `e6d67ee`.
+
 ## Validation
 
 - `cargo test -q -p krasis`: all 68 integration tests passed; no ignored tests.
@@ -96,8 +108,8 @@ assembly, kernel compilation or numerical solver algorithms.
 
 ## Current dependency/consumer boundary
 
-- Finitum committed head `451ae6956399b3512ef65e9a01edaf1a5eed64c0` plus its current W8
-  F-EVAL working tree; fallible constructors and explicit-time `_at` helpers already exist.
+- Finitum committed head `e6d67ee` includes F-EVAL and prescribed value/rate lifting;
+  fallible constructors and explicit-time `_at` helpers already exist.
 - Methodus `bec099f62ec2a0644a1540240eec83eb65c84b60` supplies typed evaluation errors and
   solver algorithms. Sinbad remains a downstream consumer undergoing W8 migration.
 - A Krasis commit alone does not pin sibling path dependencies. Workspace integration
