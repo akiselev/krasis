@@ -101,10 +101,29 @@ impl FinitumVerificationSource {
         component_count: usize,
         nodal_values: &[f64],
         tolerance: methodus::ComparisonTolerance,
-        exact: impl FnMut(&[f64]) -> Vec<f64>,
+        mut exact: impl FnMut(&[f64]) -> Vec<f64>,
+    ) -> Result<Self, VerificationRefusal> {
+        Self::try_check_patch(
+            realization,
+            component_count,
+            nodal_values,
+            tolerance,
+            |point| Ok(exact(point)),
+        )
+    }
+
+    /// Fallible nodal patch comparison, with the same report and realization binding as
+    /// [`Self::check_patch`]. A callback refusal preserves its code and origin, located by
+    /// Finitum at the first failing sampled vertex; no cell or time is invented here.
+    pub fn try_check_patch<'a>(
+        realization: impl Into<FinitumRealization<'a>>,
+        component_count: usize,
+        nodal_values: &[f64],
+        tolerance: methodus::ComparisonTolerance,
+        exact: impl FnMut(&[f64]) -> Result<Vec<f64>, finitum::InputEvaluationError>,
     ) -> Result<Self, VerificationRefusal> {
         let realization = realization.into();
-        let report = finitum::check_nodal_patch(
+        let report = finitum::try_check_nodal_patch(
             realization.mesh(),
             component_count,
             nodal_values,
@@ -1343,10 +1362,13 @@ fn require_report<T: PartialEq>(
 }
 
 fn finitum_source_refusal(error: finitum::FinitumError) -> VerificationRefusal {
-    refusal(
-        "KRASIS_VERIFY_FINITUM_SOURCE",
-        format!("Finitum verification did not validate against its bound source: {error}"),
-    )
+    match error {
+        finitum::FinitumError::InputEvaluation(error) => refusal(&error.code, error.to_string()),
+        other => refusal(
+            "KRASIS_VERIFY_FINITUM_SOURCE",
+            format!("Finitum verification did not validate against its bound source: {other}"),
+        ),
+    }
 }
 
 fn digest(bytes: &[u8]) -> String {

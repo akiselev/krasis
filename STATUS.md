@@ -1,10 +1,8 @@
 # Krasis status
 
 Updated: 2026-09-08
-Committed base: `817e796` (fallible explicit-time consumer migration).
-Milestone: W8 F3 consumer migration implemented in the working tree. All retiring Finitum
-constructor calls are migrated; removal of the last `FieldSource::Sampled` match arm is
-coordinated with the producer's enum deletion.
+Committed base: `39b98f3` (prescribed-motion checkpoint identity).
+Milestone: W8 F3 consumer deletion and fallible patch verification forwarding.
 
 ## Ownership
 
@@ -66,7 +64,7 @@ assembly, kernel compilation or numerical solver algorithms.
   errors retain point/time with no invented cell identity. A successfully returned NaN still
   follows nonfinite-state rejection, separately from a callback returning a typed error.
 
-## W8 F3 consumer migration (working tree)
+## W8 F3 consumer migration
 
 - Migrated 27 constructor/helper calls across seven integration test files:
   six `DynamicExternalInput::try_new`, six `SystemConstitutiveInput::try_new`, four
@@ -78,14 +76,12 @@ assembly, kernel compilation or numerical solver algorithms.
 - Preserved the deliberate `Ok(vec![NaN])` initial-source test. Existing K1 tests still check
   typed provider refusal, original attribution, exact rollback, no retry and initial-time
   evaluation independently of nonfinite-value rejection.
-- No retiring constructor/helper calls remain in Krasis source or tests. The **only pending
-  producer-deletion match** is `FieldSource::Sampled` in `src/initial.rs` plus its rustdoc link.
-  It stays marked temporary while Finitum still exports that enum variant. Delete it together
-  with Finitum F3; do not add a compatibility wrapper or configuration shim.
+- No retiring constructor/helper calls remain in Krasis source or tests. The final
+  `FieldSource::Sampled` match arm and rustdoc link are removed together with Finitum F3.
 - No numerical policy, coupling algorithm, public initial-state signature or execution
   identity convention changed in this migration.
 
-## Prescribed-motion checkpoint identity (working tree)
+## Prescribed-motion checkpoint identity (`39b98f3`)
 
 - Reduced-system content identity consumes Finitum's `realization_digest()`, covering
   prescribed value/rate identity and target descriptors. Static identities keep their exact
@@ -97,20 +93,28 @@ assembly, kernel compilation or numerical solver algorithms.
   clippy with warnings denied, rustdoc with warnings denied and scoped formatting passed.
   Finitum prescribed-motion prerequisite is committed at `e6d67ee`.
 
+## Fallible patch verification
+
+`FinitumVerificationSource::try_check_patch` delegates to Finitum's fallible nodal checker.
+Callback failure retains producer code and origin/location text in `VerificationRefusal`.
+The infallible checker wraps its callback in `Ok` and shares the same report path. Tests
+compare full rollback report identity between both paths and ensure the first failed vertex
+stops callback evaluation while preserving the producer refusal.
+
 ## Validation
 
-- `cargo test -q -p krasis`: all 68 integration tests passed; no ignored tests.
-- `cargo clippy -p krasis --all-targets -- -D warnings`: passed.
-- `cargo fmt -p krasis -- --check` and `git diff --check`: passed.
-- `RUSTDOCFLAGS='-D warnings' cargo doc -p krasis --no-deps`: passed.
-- These are local consumer-migration checks against the sibling working tree below;
-  final Finitum API removal and downstream Sinbad integration remain separate gates.
+- Before final F3 removal, full 70 tests passed against Finitum `5bd93cc`, none ignored.
+  Focused patch forwarding, all-target clippy, rustdoc and scoped formatting passed.
+- Final F3 gate against Finitum `23e9fd8`: all 70 tests passed, none failed or ignored;
+  all-target clippy with warnings denied, rustdoc with warnings denied, scoped formatting
+  and `git diff --check` passed.
+- These are local consumer gates; downstream Sinbad integration remains independently gated.
 
 ## Current dependency/consumer boundary
 
-- Finitum committed head `e6d67ee` includes F-EVAL and prescribed value/rate lifting;
+- Finitum committed head `23e9fd8` includes F-EVAL, prescribed value/rate lifting and F3;
   fallible constructors and explicit-time `_at` helpers already exist.
-- Methodus `bec099f62ec2a0644a1540240eec83eb65c84b60` supplies typed evaluation errors and
+- Methodus `4f52d38` supplies typed evaluation errors, candidate BDF rates and
   solver algorithms. Sinbad remains a downstream consumer undergoing W8 migration.
 - A Krasis commit alone does not pin sibling path dependencies. Workspace integration
   snapshots record the full federation disposition.
@@ -121,8 +125,6 @@ assembly, kernel compilation or numerical solver algorithms.
 
 ## Remaining scope
 
-- Delete the marked sampled-source arm/link in lockstep with Finitum F3 after all consumers
-  migrate, then repeat affected validation.
 - General DAE initialization beyond the supported reduced-row/index-1 contracts remains
   demand-driven. A barycenter P1 mass rule can be rank deficient; richer system quadrature
   and the explicit when-algebraic convention have distinct, recorded semantics.

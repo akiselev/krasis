@@ -54,7 +54,7 @@ impl<'a> NodalContext<'a> {
 ///
 /// `bindings` must name every block in `layout` exactly once. A block's component count is
 /// derived from its width over `nodal`'s vertex count (`components = width / vertex_count`,
-/// vertex-major); [`FieldSource::Constant`], [`FieldSource::Sampled`] and
+/// vertex-major); [`FieldSource::Constant`] and
 /// [`FieldSource::Fallible`] must each produce `components` values, and [`FieldSource::Nodal`]
 /// must already carry `components` values per vertex. A `Fallible` source is evaluated at every
 /// vertex at the initial time (the freshly committed state's time, `0.0`); its typed refusal
@@ -137,23 +137,6 @@ fn evaluate_field_source(
                 });
             }
             Ok(values.clone())
-        }
-        // F3 coordination: remove this arm when Finitum removes the Sampled variant.
-        // All sampled-source constructions in Krasis tests now use the fallible path below.
-        FieldSource::Sampled(sampler) => {
-            let mut assembled = Vec::with_capacity(components * nodal.vertex_count());
-            for coordinates in nodal.coordinates() {
-                let value = sampler(coordinates);
-                if value.len() != components {
-                    return Err(KrasisError::FieldLength {
-                        field: block.to_string(),
-                        actual: value.len(),
-                        expected: components,
-                    });
-                }
-                assembled.extend(value);
-            }
-            Ok(assembled)
         }
         FieldSource::Fallible(sampler) => {
             let mut assembled = Vec::with_capacity(components * nodal.vertex_count());

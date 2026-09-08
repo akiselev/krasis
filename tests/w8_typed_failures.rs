@@ -1009,3 +1009,72 @@ fn consistent_initialization_when_algebraic_solves_only_with_an_algebraic_row() 
         assert_eq!(always_execution.integrator().accepted_steps, STEPS as u64);
     }
 }
+
+#[test]
+fn fallible_patch_preserves_report_identity_and_first_callback_refusal() {
+    let fixture = two_heat_leaves(&compile(), 0.8, None, true, false);
+    let context = EvaluationContext::reproducible();
+    let config = fixed_step_config(STEP);
+    let execution =
+        CoupledExecution::new(fixture.operator.clone(), initial_state(&fixture), &context).unwrap();
+    let values = initial_values(&fixture);
+    let tolerance = ComparisonTolerance {
+        absolute: 1e-12,
+        relative: 1e-12,
+    };
+    let sources = |fallible| {
+        let make = |reduced: &ReducedSystemOperator,
+                    values: &[f64],
+                    exact: fn(&[f64]) -> Vec<f64>| {
+            if fallible {
+                FinitumVerificationSource::try_check_patch(reduced, 1, values, tolerance, |point| {
+                    Ok(exact(point))
+                })
+            } else {
+                FinitumVerificationSource::check_patch(reduced, 1, values, tolerance, exact)
+            }
+            .unwrap()
+        };
+        FinitumVerificationSource::compose([
+            make(
+                &fixture.hot.reduced,
+                &values[fixture.operator.leaf_range(0).unwrap()],
+                bump,
+            ),
+            make(
+                &fixture.cold.reduced,
+                &values[fixture.operator.leaf_range(1).unwrap()],
+                |_| vec![0.0],
+            ),
+        ])
+    };
+    let old =
+        check_rollback_identity(&execution, &context, STEP, &config, &sources(false)).unwrap();
+    let new = check_rollback_identity(&execution, &context, STEP, &config, &sources(true)).unwrap();
+    assert_eq!(old, new);
+    let mut visited = Vec::new();
+    let error = FinitumVerificationSource::try_check_patch(
+        &fixture.hot.reduced,
+        1,
+        &values[fixture.operator.leaf_range(0).unwrap()],
+        tolerance,
+        |point| {
+            visited.push(point.to_vec());
+            if visited.len() == 2 {
+                Err(InputEvaluationError::new(
+                    "EXACT_RATE_MISSING",
+                    InputOrigin::Provider("exact".into()),
+                    "producer refusal",
+                ))
+            } else {
+                Ok(bump(point))
+            }
+        },
+    )
+    .unwrap_err();
+    assert_eq!(visited.len(), 2);
+    assert_eq!(error.code, "EXACT_RATE_MISSING");
+    assert!(error.message.contains("exact"));
+    assert!(error.message.contains("point ("));
+    assert!(error.message.contains("producer refusal"));
+}
