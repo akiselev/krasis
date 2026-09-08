@@ -21,7 +21,7 @@ use finitum::{
     BlockLayout, CellId, ConstraintSet, FieldSource, InputEvaluationError, InputOrigin,
     MeshProfile, PointEvaluation, ReducedSystemOperator, RegionMap, RegionTagId,
     SystemConstitutiveInput, SystemEssentialConstraintRequirement, SystemRealizationPlan,
-    TaggedMesh, essential_constraints_from_system, realize,
+    TaggedMesh, essential_constraints_from_system_at, realize,
 };
 use krasis::{
     AttemptDisposition, BlockId, CoupledExecution, CoupledLeaf, CoupledSystemOperator,
@@ -209,14 +209,14 @@ fn constitutive(
                             },
                         )
                     }
-                    _ => SystemConstitutiveInput::new(
+                    _ => SystemConstitutiveInput::try_new(
                         block.equation.clone(),
                         integral.integral_index,
                         input.id,
                         1,
                         format!("krasis-heat/{name}={value}"),
-                        move |_: &PointEvaluation| vec![value],
-                        |_: &PointEvaluation, _: &PointEvaluation| vec![0.0],
+                        move |_: &PointEvaluation| Ok(vec![value]),
+                        |_: &PointEvaluation, _: &PointEvaluation| Ok(vec![0.0]),
                     ),
                 };
                 constitutive.push(built.unwrap());
@@ -283,7 +283,8 @@ fn heat_instance(
                 });
             }
         }
-        essential_constraints_from_system(&operator, &tagged, &region_map, &requirements).unwrap()
+        essential_constraints_from_system_at(&operator, &tagged, &region_map, &requirements, 0.0)
+            .unwrap()
     } else {
         ConstraintSet::new(vertex_count, []).unwrap()
     };
@@ -697,13 +698,16 @@ fn initial_state_from_evaluates_a_fallible_source_at_the_initial_time_and_refuse
         Ok(bump(point))
     });
 
-    // A succeeding fallible source projects exactly as the sampled one, sampled at `t = 0`.
+    // A time-observed fallible source projects exactly as the baseline, at `t = 0`.
     let sampled = fixture
         .operator
         .initial_state_from(
             4,
             &[
-                (hot_block.clone(), FieldSource::sampled(bump)),
+                (
+                    hot_block.clone(),
+                    FieldSource::fallible(move |coordinates, _time| Ok(bump(coordinates))),
+                ),
                 (cold_block.clone(), FieldSource::constant([0.0])),
             ],
         )

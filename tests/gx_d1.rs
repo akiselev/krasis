@@ -233,35 +233,36 @@ fn linear_diffusion_realization() -> (RealizationPlan, StateLayout) {
             let name = &model.symbols[input.binding.symbol.index()].name;
             match name.as_str() {
                 "capacity" => dynamic.push(
-                    DynamicExternalInput::new(
+                    DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         1,
                         "capacity=1;direction=0/v1",
-                        |_| vec![1.0],
-                        |_, _| vec![0.0],
+                        |_| Ok(vec![1.0]),
+                        |_, _| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),
                 "k" => dynamic.push(
-                    DynamicExternalInput::new(
+                    DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         1,
                         "k=1;direction=0/v1",
-                        |_| vec![1.0],
-                        |_, _| vec![0.0],
+                        |_| Ok(vec![1.0]),
+                        |_, _| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),
                 "f" => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled_at(
                         integral.integral_index,
                         input.id,
                         1,
                         &mesh,
                         &element,
-                        |_, _| vec![0.0],
+                        0.0,
+                        |_, _, _time| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),
@@ -585,7 +586,7 @@ fn initial_state_from_projects_constant_and_sampled_sources() {
 
     let bindings = vec![(
         BlockId::new("u"),
-        FieldSource::sampled(|coordinates| vec![coordinates[0] + 2.0 * coordinates[1]]),
+        FieldSource::fallible(|coordinates, _time| Ok(vec![coordinates[0] + 2.0 * coordinates[1]])),
     )];
     let state = initial_state_from(&layout, &nodal, 2, &bindings).unwrap();
     let expected: Vec<f64> = vertices.iter().map(|c| c[0] + 2.0 * c[1]).collect();
@@ -621,7 +622,7 @@ fn initial_state_from_projects_a_vector_valued_block() {
     let nodal = NodalContext::new(&vertices).unwrap();
     let bindings = vec![(
         BlockId::new("velocity"),
-        FieldSource::sampled(|coordinates| vec![coordinates[0], -coordinates[1]]),
+        FieldSource::fallible(|coordinates, _time| Ok(vec![coordinates[0], -coordinates[1]])),
     )];
     let state = initial_state_from(&layout, &nodal, 0, &bindings).unwrap();
     let mut expected = Vec::new();
@@ -676,7 +677,10 @@ fn initial_state_from_refuses_dimension_mismatch_and_non_finite_values() {
     let error = initial_state_from(&layout, &nodal, 0, &bindings).unwrap_err();
     assert!(matches!(error, KrasisError::FieldLength { .. }));
 
-    let bindings = vec![(BlockId::new("u"), FieldSource::sampled(|_| vec![f64::NAN]))];
+    let bindings = vec![(
+        BlockId::new("u"),
+        FieldSource::fallible(|_, _time| Ok(vec![f64::NAN])),
+    )];
     let error = initial_state_from(&layout, &nodal, 0, &bindings).unwrap_err();
     assert!(matches!(error, KrasisError::NonFiniteValue { .. }));
 }

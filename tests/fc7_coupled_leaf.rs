@@ -19,7 +19,7 @@ use finitum::{
     ExternalInput, FieldSource, Mesh, MeshProfile, PointEvaluation, PreparedElement,
     RealizationPlan, ReducedSystemOperator, RegionMap, RegionTagId, SystemConstitutiveInput,
     SystemEssentialConstraintRequirement, SystemRealizationPlan, TaggedMesh,
-    essential_constraints_from_selected, essential_constraints_from_system, realize,
+    essential_constraints_from_selected_at, essential_constraints_from_system_at, realize,
 };
 use krasis::{
     AttemptDisposition, BlockId, CoupledExecution, CoupledLeaf, CoupledOperator,
@@ -102,13 +102,14 @@ fn plan_path(tagged: &TaggedMesh) -> (CoupledOperator, StateLayout) {
     }
     let values = vec![FieldSource::constant([0.0]); requirements.essential_constraints.len()];
     let selection = vec![ComponentSelection::All; requirements.essential_constraints.len()];
-    let constraints = essential_constraints_from_selected(
+    let constraints = essential_constraints_from_selected_at(
         tagged,
         &dofs,
         &requirements.essential_constraints,
         &region_map,
         &values,
         &selection,
+        0.0,
     )
     .unwrap();
     let model = model(&compilation.semantic.models);
@@ -122,24 +123,25 @@ fn plan_path(tagged: &TaggedMesh) -> (CoupledOperator, StateLayout) {
             let name = model.symbols[input.binding.symbol.index()].name.as_str();
             match name {
                 "capacity" | "k" => dynamic.push(
-                    DynamicExternalInput::new(
+                    DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         1,
                         format!("corpus-02/{name}=1"),
-                        |_| vec![1.0],
-                        |_, _| vec![0.0],
+                        |_| Ok(vec![1.0]),
+                        |_, _| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),
                 "f" => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled_at(
                         integral.integral_index,
                         input.id,
                         1,
                         &tagged.mesh,
                         &element,
-                        |_, _| vec![0.0],
+                        0.0,
+                        |_, _, _time| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),
@@ -192,14 +194,14 @@ fn system_path(tagged: &TaggedMesh) -> ReducedSystemOperator {
                     other => panic!("unexpected non-basis input {other}"),
                 };
                 constitutive.push(
-                    SystemConstitutiveInput::new(
+                    SystemConstitutiveInput::try_new(
                         block.equation.clone(),
                         integral.integral_index,
                         input.id,
                         1,
                         format!("corpus-02/{name}={value}"),
-                        move |_: &PointEvaluation| vec![value],
-                        |_: &PointEvaluation, _: &PointEvaluation| vec![0.0],
+                        move |_: &PointEvaluation| Ok(vec![value]),
+                        |_: &PointEvaluation, _: &PointEvaluation| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 );
@@ -220,7 +222,8 @@ fn system_path(tagged: &TaggedMesh) -> ReducedSystemOperator {
         }
     }
     let constraints =
-        essential_constraints_from_system(&operator, tagged, &region_map, &requirements).unwrap();
+        essential_constraints_from_system_at(&operator, tagged, &region_map, &requirements, 0.0)
+            .unwrap();
     operator.reduced(constraints).unwrap()
 }
 
@@ -301,7 +304,7 @@ fn one_leaf_reduced_system_sources_match_the_coupled_operator_path() {
     // Initial state: one `NodalContext` over the shared mesh, the same `FieldSource` on both
     // layouts, and the composition's own per-leaf projection -- all bitwise equal.
     let nodal = NodalContext::new(tagged.mesh.vertices()).unwrap();
-    let initial = FieldSource::sampled(exact_initial);
+    let initial = FieldSource::fallible(move |coordinates, _time| Ok(exact_initial(coordinates)));
     let plan_state = initial_state_from(
         &plan_layout,
         &nodal,

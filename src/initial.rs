@@ -138,6 +138,8 @@ fn evaluate_field_source(
             }
             Ok(values.clone())
         }
+        // F3 coordination: remove this arm when Finitum removes the Sampled variant.
+        // All sampled-source constructions in Krasis tests now use the fallible path below.
         FieldSource::Sampled(sampler) => {
             let mut assembled = Vec::with_capacity(components * nodal.vertex_count());
             for coordinates in nodal.coordinates() {

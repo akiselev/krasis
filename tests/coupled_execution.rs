@@ -447,45 +447,46 @@ fn coupled_fixture_variant(
             let name = &model.symbols[input.binding.symbol.index()].name;
             match name.as_str() {
                 "capacity" => dynamic.push(
-                    DynamicExternalInput::new(
+                    DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         1,
                         "capacity=1;direction=0/v1",
-                        |_| vec![1.0],
-                        |_, _| vec![0.0],
+                        |_| Ok(vec![1.0]),
+                        |_, _| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),
                 "k" => dynamic.push(
-                    DynamicExternalInput::new(
+                    DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         1,
                         conductivity_identity,
                         move |evaluation| {
-                            vec![
+                            Ok(vec![
                                 1.0 + conductivity_slope
                                     * evaluation.values(DerivativeEvaluation::Value).unwrap()[0],
-                            ]
+                            ])
                         },
                         move |_, direction| {
-                            vec![
+                            Ok(vec![
                                 conductivity_slope
                                     * direction.values(DerivativeEvaluation::Value).unwrap()[0],
-                            ]
+                            ])
                         },
                     )
                     .unwrap(),
                 ),
                 "f" => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled_at(
                         integral.integral_index,
                         input.id,
                         1,
                         &mesh,
                         &element,
-                        |_, _| vec![0.0],
+                        0.0,
+                        |_, _, _time| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),

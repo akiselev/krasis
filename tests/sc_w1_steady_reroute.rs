@@ -18,7 +18,7 @@ use std::fs;
 use finitum::{
     BlockLayout, ConstraintSet, FieldSource, MeshProfile, RegionMap, RegionTagId,
     SystemConstitutiveInput, SystemEssentialConstraintRequirement, SystemRealizationPlan,
-    essential_constraints_from_system, quadratic_simplex_dof_map, realize,
+    essential_constraints_from_system_at, quadratic_simplex_dof_map, realize,
 };
 use krasis::{
     BlockLinearAlgorithm, BlockLinearExecution, BlockLinearSolver, KrasisError, OperatorIdentity,
@@ -101,30 +101,30 @@ fn stokes_constitutive(system: &OperatorSystem) -> Vec<SystemConstitutiveInput> 
                 }
                 let components = input.shape.iter().product::<usize>().max(1);
                 let binding = if components == 4 {
-                    SystemConstitutiveInput::new(
+                    SystemConstitutiveInput::try_new(
                         block.equation.clone(),
                         integral.integral_index,
                         input.id,
                         components,
                         "sc-w1-reroute/viscosity",
                         |evaluation: &finitum::PointEvaluation| {
-                            stress(
+                            Ok(stress(
                                 evaluation
                                     .values(DerivativeEvaluation::SymmetricGradient)
                                     .expect("active symmetric-gradient input"),
-                            )
+                            ))
                         },
                         |_evaluation: &finitum::PointEvaluation,
                          direction: &finitum::PointEvaluation| {
-                            stress(
+                            Ok(stress(
                                 direction
                                     .values(DerivativeEvaluation::SymmetricGradient)
                                     .expect("active symmetric-gradient direction"),
-                            )
+                            ))
                         },
                     )
                 } else if components == 2 {
-                    SystemConstitutiveInput::new(
+                    SystemConstitutiveInput::try_new(
                         block.equation.clone(),
                         integral.integral_index,
                         input.id,
@@ -133,24 +133,24 @@ fn stokes_constitutive(system: &OperatorSystem) -> Vec<SystemConstitutiveInput> 
                         |evaluation: &finitum::PointEvaluation| {
                             let x = evaluation.coordinates[0];
                             let y = evaluation.coordinates[1];
-                            vec![y - 0.5, 0.5 - x]
+                            Ok(vec![y - 0.5, 0.5 - x])
                         },
                         move |_evaluation: &finitum::PointEvaluation,
                               _direction: &finitum::PointEvaluation| {
-                            vec![0.0; components]
+                            Ok(vec![0.0; components])
                         },
                     )
                 } else {
-                    SystemConstitutiveInput::new(
+                    SystemConstitutiveInput::try_new(
                         block.equation.clone(),
                         integral.integral_index,
                         input.id,
                         components,
                         "sc-w1-reroute/zero",
-                        move |_evaluation: &finitum::PointEvaluation| vec![0.0; components],
+                        move |_evaluation: &finitum::PointEvaluation| Ok(vec![0.0; components]),
                         move |_evaluation: &finitum::PointEvaluation,
                               _direction: &finitum::PointEvaluation| {
-                            vec![0.0; components]
+                            Ok(vec![0.0; components])
                         },
                     )
                 };
@@ -203,7 +203,7 @@ fn steady_fixture(subdivisions: usize, equation_sign: BTreeMap<String, f64>) -> 
         .expect("momentum declares one essential-constraint requirement")
         .clone();
     let region_map = walls_region_map(momentum_requirement.region);
-    let constraints = essential_constraints_from_system(
+    let constraints = essential_constraints_from_system_at(
         &operator,
         &mesh,
         &region_map,
@@ -212,6 +212,7 @@ fn steady_fixture(subdivisions: usize, equation_sign: BTreeMap<String, f64>) -> 
             requirement: momentum_requirement,
             value: FieldSource::constant(vec![0.0, 0.0]),
         }],
+        0.0,
     )
     .unwrap();
     let reduced = operator.reduced(constraints).unwrap();

@@ -195,24 +195,25 @@ fn diffusion_realization(
             let name = &model.symbols[input.binding.symbol.index()].name;
             match name.as_str() {
                 "capacity" | "k" => dynamic.push(
-                    DynamicExternalInput::new(
+                    DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         1,
                         "unit;direction=0/v1",
-                        |_| vec![1.0],
-                        |_, _| vec![0.0],
+                        |_| Ok(vec![1.0]),
+                        |_, _| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),
                 "f" => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled_at(
                         integral.integral_index,
                         input.id,
                         1,
                         &mesh,
                         &element,
-                        |_, _| vec![0.0],
+                        0.0,
+                        |_, _, _time| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),

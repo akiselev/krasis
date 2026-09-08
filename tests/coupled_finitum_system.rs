@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use finitum::{
     BlockLayout, FieldSource, MeshProfile, PointEvaluation, ReducedSystemOperator, RegionMap,
     RegionTagId, SysVarId, SystemConstitutiveInput, SystemEssentialConstraintRequirement,
-    SystemRealizationPlan, TaggedMesh, essential_constraints_from_system, realize,
+    SystemRealizationPlan, TaggedMesh, essential_constraints_from_system_at, realize,
 };
 use krasis::{
     AttemptDisposition, BlockId, CoupledExecution, CoupledLeaf, CoupledSystemOperator,
@@ -92,14 +92,14 @@ fn constant_constitutive(compiled: &Compiled, source: f64) -> Vec<SystemConstitu
                     other => panic!("unexpected non-basis input {other}"),
                 };
                 constitutive.push(
-                    SystemConstitutiveInput::new(
+                    SystemConstitutiveInput::try_new(
                         block.equation.clone(),
                         integral.integral_index,
                         input.id,
                         1,
                         format!("krasis-heat/{name}={value}"),
-                        move |_: &PointEvaluation| vec![value],
-                        |_: &PointEvaluation, _: &PointEvaluation| vec![0.0],
+                        move |_: &PointEvaluation| Ok(vec![value]),
+                        |_: &PointEvaluation, _: &PointEvaluation| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 );
@@ -159,7 +159,8 @@ fn heat_instance(compiled: &Compiled, subdivisions: usize, source: f64) -> HeatI
         }
     }
     let constraints =
-        essential_constraints_from_system(&operator, &tagged, &region_map, &requirements).unwrap();
+        essential_constraints_from_system_at(&operator, &tagged, &region_map, &requirements, 0.0)
+            .unwrap();
     let reduced = operator.reduced(constraints).unwrap();
     let mut row_kinds = vec![RowKind::Differential; vertex_count];
     for constraint in reduced.constraints().constraints() {
@@ -787,7 +788,7 @@ fn initial_state_from_projects_onto_each_leaf_mesh() {
         .iter()
         .map(|block| {
             let source = if block.id().as_str().starts_with("hot/") {
-                FieldSource::sampled(bump)
+                FieldSource::fallible(move |coordinates, _time| Ok(bump(coordinates)))
             } else {
                 FieldSource::constant([0.0])
             };
