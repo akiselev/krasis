@@ -34,8 +34,9 @@ use methodus::{
 use serde::{Deserialize, Serialize};
 
 use crate::coupled::{
-    ConsistentInitialization, FinitumRealization, TransactionalOperator,
-    consistent_initialization_identity, solve_consistent_state_rate_for,
+    ConsistentInitialization, FinitumRealization, RateSolvePolicy, TransactionalOperator,
+    consistent_initialization_identity, make_initial_state_consistent_for,
+    solve_consistent_state_rate_for,
 };
 use crate::{
     BlockId, CoupledOperator, FieldId, KrasisError, NodalContext, OperatorIdentity, RowKind,
@@ -628,9 +629,30 @@ impl CoupledSystemOperator {
     /// the Newton policy for index-1 consistent initialization, folded into the identity;
     /// semantics as [`CoupledOperator::with_consistent_initialization`], evaluated over the
     /// composed residual so cross-leaf edges take part.
-    pub fn with_consistent_initialization(
+    pub fn with_consistent_initialization(self, newton: NewtonConfig) -> Result<Self, KrasisError> {
+        self.record_consistent_initialization(newton, RateSolvePolicy::Always)
+    }
+
+    /// As [`Self::with_consistent_initialization`], except that the composed index-1 rate
+    /// solve runs only when the composed mask marks at least one row algebraic (a constrained
+    /// row, a pressure row). An all-differential composition evaluates the composed residual
+    /// once at the initial state and zero rate instead (a typed evaluation failure surfaces
+    /// there, as on the solve path) and never inverts any leaf's mass; with an algebraic row
+    /// the behavior is exactly the existing path's. The identity differs from the always-solve
+    /// path's (`krasis-consistent-init/2` payload); [`Self::solve_consistent_state_rate`] is
+    /// unchanged and always solves. See
+    /// [`CoupledOperator::with_consistent_initialization_when_algebraic`].
+    pub fn with_consistent_initialization_when_algebraic(
+        self,
+        newton: NewtonConfig,
+    ) -> Result<Self, KrasisError> {
+        self.record_consistent_initialization(newton, RateSolvePolicy::WhenAlgebraic)
+    }
+
+    fn record_consistent_initialization(
         mut self,
         newton: NewtonConfig,
+        policy: RateSolvePolicy,
     ) -> Result<Self, KrasisError> {
         let mut mask = Vec::with_capacity(self.dimension());
         for leaf in &self.leaves {
@@ -645,9 +667,13 @@ impl CoupledSystemOperator {
         self.identity = format!(
             "{}:consistent-init={}",
             self.identity,
-            consistent_initialization_identity(&mask, &newton)
+            consistent_initialization_identity(&mask, &newton, policy)
         );
-        self.consistent_initialization = Some(ConsistentInitialization { mask, newton });
+        self.consistent_initialization = Some(ConsistentInitialization {
+            mask,
+            newton,
+            policy,
+        });
         Ok(self)
     }
 
@@ -925,15 +951,16 @@ impl DaeOperator for CoupledSystemOperator {
         time: f64,
         state: &mut [f64],
     ) -> Result<(), NumericError> {
-        if self.consistent_initialization.is_none() {
-            return Ok(());
-        }
-        // Validates that a consistent composed state rate exists; never adjusts `state`.
-        self.solve_consistent_state_rate(context, time, state)
-            .map(|_| ())
-            .map_err(|error| NumericError::Operator {
-                message: error.to_string(),
-            })
+        // Validates that a consistent composed state rate exists (or, under the when-algebraic
+        // policy with no algebraic row, that the composed residual evaluates); never adjusts
+        // `state`. A typed evaluation failure goes back out as itself.
+        make_initial_state_consistent_for(
+            self,
+            self.consistent_initialization.as_ref(),
+            context,
+            time,
+            state,
+        )
     }
 
     fn event_count(&self) -> usize {

@@ -1,7 +1,9 @@
 //! Initial-condition projection from Finitum field sources onto a P1 nodal DOF map.
 
-use finitum::FieldSource;
+use finitum::{FieldSource, FinitumError, InputEvaluationError, InputLocation};
+use methodus::NumericError;
 
+use crate::coupled::krasis_numeric_error;
 use crate::{BlockId, FieldId, KrasisError, SimulationState, StateLayout};
 
 /// Vertex coordinates for pointwise evaluation of a [`FieldSource`] onto a P1 nodal DOF map.
@@ -52,10 +54,15 @@ impl<'a> NodalContext<'a> {
 ///
 /// `bindings` must name every block in `layout` exactly once. A block's component count is
 /// derived from its width over `nodal`'s vertex count (`components = width / vertex_count`,
-/// vertex-major); [`FieldSource::Constant`] and [`FieldSource::Sampled`] must each produce
-/// `components` values, and [`FieldSource::Nodal`] must already carry `components` values per
-/// vertex. Any `FieldSource` variant this function does not evaluate pointwise (for example a
-/// future table- or kernel-backed source) is refused rather than silently mismatched.
+/// vertex-major); [`FieldSource::Constant`], [`FieldSource::Sampled`] and
+/// [`FieldSource::Fallible`] must each produce `components` values, and [`FieldSource::Nodal`]
+/// must already carry `components` values per vertex. A `Fallible` source is evaluated at every
+/// vertex at the initial time (the freshly committed state's time, `0.0`); its typed refusal
+/// is returned as [`KrasisError::EvaluationRefused`] with the producer's code and origin,
+/// located at the vertex and time (a nodal datum belongs to no cell), through the same
+/// Finitum-to-Methodus mapping every operator boundary uses. Any `FieldSource` variant this
+/// function does not evaluate pointwise (`Table`, `Kernel`) is refused rather than silently
+/// mismatched.
 pub fn initial_state_from(
     layout: &StateLayout,
     nodal: &NodalContext,
@@ -90,7 +97,7 @@ pub fn initial_state_from(
         }
         let components = width / vertex_count;
         let source = resolved[block.id()];
-        let values = evaluate_field_source(block.id(), source, nodal, components)?;
+        let values = evaluate_field_source(block.id(), source, nodal, components, state.time())?;
         state.insert_field(FieldId::new(block.id().as_str()), values)?;
     }
     Ok(state)
@@ -101,11 +108,10 @@ fn evaluate_field_source(
     source: &FieldSource,
     nodal: &NodalContext,
     components: usize,
+    time: f64,
 ) -> Result<Vec<f64>, KrasisError> {
-    // `FieldSource` is not `#[non_exhaustive]`, so every current variant is matched by name;
-    // the wildcard arm is unreachable today but keeps this function compiling (refusing rather
-    // than mismatching) once Finitum adds a non-pointwise variant such as `Table` or `Kernel`.
-    #[allow(unreachable_patterns)]
+    // Every pointwise variant is matched by name; the wildcard arm refuses the non-pointwise
+    // ones (`Table`, `Kernel`) and any variant Finitum adds later, rather than mismatching.
     match source {
         FieldSource::Constant(values) => {
             if values.len() != components {
@@ -147,8 +153,42 @@ fn evaluate_field_source(
             }
             Ok(assembled)
         }
-        // Non-exhaustive by design: a future `FieldSource` variant (for example table- or
-        // kernel-backed) is refused here rather than silently mismatched.
+        FieldSource::Fallible(sampler) => {
+            let mut assembled = Vec::with_capacity(components * nodal.vertex_count());
+            for coordinates in nodal.coordinates() {
+                let value = sampler(coordinates, time)
+                    .map_err(|failure| fallible_source_refusal(failure, coordinates, time))?;
+                if value.len() != components {
+                    return Err(KrasisError::FieldLength {
+                        field: block.to_string(),
+                        actual: value.len(),
+                        expected: components,
+                    });
+                }
+                assembled.extend(value);
+            }
+            Ok(assembled)
+        }
+        // A non-pointwise variant (`Table`, `Kernel`) or one Finitum adds later is refused here
+        // rather than silently mismatched.
         _ => Err(KrasisError::InitialSourceNotPointwise(block.to_string())),
     }
+}
+
+/// A `Fallible` source's refusal as Krasis reports it: located at the vertex and initial time
+/// it was sampled at (no cell: a nodal datum belongs to none), then carried through the same
+/// Finitum-to-Methodus mapping every operator boundary uses (`FinitumError::InputEvaluation`
+/// -> `NumericError::Evaluation`), so the code, origin and located message read exactly as
+/// they do when the same source fails inside a Finitum sampling site.
+fn fallible_source_refusal(
+    mut failure: InputEvaluationError,
+    point: &[f64],
+    time: f64,
+) -> KrasisError {
+    failure.location = Some(Box::new(InputLocation {
+        cell: None,
+        point: point.to_vec(),
+        time: Some(time),
+    }));
+    krasis_numeric_error(NumericError::from(FinitumError::from(failure)))
 }

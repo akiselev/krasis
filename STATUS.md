@@ -1,12 +1,14 @@
 # Krasis status
 
-Updated: 2026-09-05
+Updated: 2026-09-07
 Milestone: SV0-B4 reusable coupled verification + GX-D1 initial-condition
 projection + E6 transactional block-linear composition + W7 batch P / SC-W1
 (`CoupledSystemOperator` N-leaf DAE composition with Newton inside BDF, Newton-Krylov and
 partitioned solver hooks, Finitum `ReducedSystemOperator` leaves, the SV7-F2 coupling graph,
 content-addressed `BlockLinearExecution` steady-runner target; FC7 verification sources and
-initial-state projection over `CoupledLeaf::reduced_system`)
+initial-state projection over `CoupledLeaf::reduced_system`) + W8 lane K1 (typed evaluation
+failures pass through Krasis transactions unchanged; `FieldSource::Fallible` projection;
+`with_consistent_initialization_when_algebraic`)
 
 ## Implemented
 
@@ -190,6 +192,80 @@ initial-state projection over `CoupledLeaf::reduced_system`)
   `BlockLayout::new_keyed` layout binds `SemanticId(SysVarId)` / `field_<variable>` and
   `SystemRealizationPlan::new` still refuses that keyed layout. 62 tests at this head.
 
+- W8 lane K1 (2026-09-07; workspace PLAN §6 W8 decision 3, GX-CONTRACTS C12.9 item 6; against
+  Methodus `bec099f` `NumericError::Evaluation` and Finitum `babc740` F2): **typed evaluation
+  failures pass through Krasis transactions unchanged.** Additive, no existing signature,
+  default, digest or trajectory changed. Public surface: `KrasisError::EvaluationRefused { code,
+  origin, message }` (display `{code} at {origin}: {message}`, the text Methodus's
+  `NumericError::Evaluation` displays); `EvaluationRefusal { code, origin, message }` (`Eq`,
+  serde) and `RefusedAttempt { refusal, time, step }`; `CoupledExecution::evaluation_refusals()
+  -> &[RefusedAttempt]`, the execution's in-memory transaction log (not in `CoupledCheckpoint`,
+  untouched by `restore`); `CoupledOperator::with_consistent_initialization_when_algebraic(mask,
+  newton)` and `CoupledSystemOperator::with_consistent_initialization_when_algebraic(newton)`;
+  `RollbackIdentityReport.evaluation_refusal` and `HistoryReport.evaluation_refusal:
+  Option<EvaluationRefusal>` (`#[serde(default, skip_serializing_if = "Option::is_none")]`, so
+  every earlier report digest is unchanged; `AttemptDisposition` keeps its three `Copy`
+  variants). Behaviour: (1) the three re-wrap sites never flatten a typed failure --
+  `CoupledOperator`'s residual/JVP boundary is now `NumericError::from(FinitumError)` (Finitum's
+  own mapping: `InputEvaluation` -> `Evaluation`, everything else the identical `Operator {
+  message }` text), and both `make_initial_state_consistent`s go through one shared helper whose
+  `solve_consistent_state_rate_for` keeps `Evaluation` typed through `solve_newton` and the
+  algebraic-row residual; `CoupledSystemOperator` leaf residuals/JVPs already propagated the
+  leaf's `NumericError` by `?`. (2) `initial_state_from` gains the `FieldSource::Fallible` arm:
+  `sampler(x, t0)` at every vertex at the fresh state's time `0.0`; a refusal is located `{ cell:
+  None, point, time: Some(0) }` and carried through `FinitumError::InputEvaluation` ->
+  `NumericError::Evaluation` -> `KrasisError::EvaluationRefused`, so its message reads exactly
+  as Finitum's own sampling sites write it (`point (x, y), t = 0: <message>`);
+  `CoupledSystemOperator::initial_state_from` inherits the arm. (3) `attempt_step` /
+  `attempt_step_with` (one `transact_step`): a `SolveError::Numeric(Evaluation)` rolls the trial
+  back exactly as any solver error, is appended to the log with the committed time and the
+  attempted step, and returns `Err(EvaluationRefused)` -- never `Ok(Rejected)` with a smaller
+  suggested step; Methodus makes one implicit solve and one residual evaluation before it and
+  never forms a Jacobian action (counted in the test), so no Newton iteration and no retry.
+  `CoupledExecution::new` maps a typed failure from `BdfState::initialize` (consistent
+  initialization) the same way, and `BlockLinearExecution::solve` after its rollback. A
+  non-finite residual keeps today's disposition (Methodus damping / step control). (4) the
+  when-algebraic opt-in: identity payload `krasis-consistent-init/2` with `policy:
+  "when-algebraic"` (the `/1` payload and every existing identity unchanged); with an algebraic
+  row the behaviour is the existing path's bitwise; with none, `make_initial_state_consistent`
+  evaluates the residual once at `(t0, y0, ydot = 0)` (a typed failure surfaces there,
+  non-finite is refused) and never inverts any mass; `solve_consistent_state_rate` always
+  solves. (5) verification: `numeric_refusal` / `krasis_refusal` report a typed failure under
+  the producer's code with message `{origin}: {message}` (`KRASIS_VERIFY_NUMERIC` /
+  `KRASIS_VERIFY_STATE` for everything else, as before); `check_rollback_identity` and
+  `check_history_and_rejection` keep `AttemptDisposition::SolverError` for the probed attempt
+  and record the refusal in the optional field. Evidence: `tests/w8_typed_failures.rs` (5
+  tests) over the two-leaf Finitum heat fixture with `hot`'s diffusivity bound through
+  `SystemConstitutiveInput::try_new`, refusing at one cell with `RUN_TANGENT_UNAVAILABLE` /
+  `Slot("provider/diffusivity")` once armed: `attempt_step_with` (dense, counted solver) and
+  `attempt_step` and the Newton-Krylov hook all return the identical `EvaluationRefused` with the
+  located message (`point (..), t = 0.04, cell 2: ..`), exactly one implicit solve and one
+  residual evaluation reach the callback, no direction callback runs, the checkpoint is
+  byte-identical before and after, the log holds the same code/origin with `time = 0.02`,
+  `step = 0.02`, and the disarmed execution continues to the never-refusing trajectory bitwise;
+  the same typed error from `make_initial_state_consistent`, `solve_consistent_state_rate` and
+  `CoupledExecution::new` when armed at `t = 0`; a succeeding `FieldSource::fallible` projects
+  bitwise as the sampled source through both `initial_state_from`s and is sampled at `t = 0`
+  at every vertex, a refusing one is `EvaluationRefused { RUN_INITIAL_DATA_UNAVAILABLE,
+  initial/u, "point (x, y), t = 0: .." }` at the first refusing vertex; `check_cross_block_
+  derivatives` and `check_restart_trajectory` refuse under the producer's code,
+  `check_rollback_identity` / `check_history_and_rejection` pass byte-identically with
+  `evaluation_refusal` recorded (round-trips, revalidates; absent from the JSON of a report
+  without one); the when-algebraic opt-in on the constrained fixture solves exactly as the
+  existing path (same callback counts, bitwise initial state and 5-step trajectory) and on an
+  all-differential fixture (both instances reduced with an empty `ConstraintSet`) makes exactly
+  one residual evaluation and zero direction calls, with a bitwise-identical initial state and
+  trajectory (the brief asked 1e-12). `tests/gx_d1.rs` (+1): the single-realization opt-in on
+  the diffusion plan with its algebraic mask gives the same rate and the same inconsistent-row
+  refusal as the existing builder, and on the P1 reaction plan with an all-differential mask
+  (rank-deficient barycenter mass, C11.8) initializes without solving. 68 tests at this head.
+  Limits: the `Fallible` arm samples at the fresh state's `0.0` (no `_at(time)` form, since the
+  projected state is committed at `t = 0`); `EvaluationRefusal.message` carries Finitum's located
+  text (point, time, cell) inside the string because `NumericError::Evaluation` carries strings
+  only; the refusal log is in memory (a restarted execution starts with an empty one);
+  `BlockLinearExecution`'s typed path has no test of its own (its action is Finitum's
+  `LinearOperator::apply`, mapped by the same `From`).
+
 ## Boundary
 
 Scientia owns scientific/coupling meaning, Finitum owns concrete discrete operators,
@@ -224,7 +300,7 @@ path dependencies (sibling repositories), so this wave formats Krasis alone:
 ```text
 cargo fmt -p krasis -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test                                              # 46 passed (SC-W1 commit); 54 passed (batch P commit); 55 passed (solver hook); 58 passed (Finitum leaf); 62 passed (FC7 over coupled leaves, 2026-09-05, per test binary in the foreground)
+cargo test                                              # 46 passed (SC-W1 commit); 54 passed (batch P commit); 55 passed (solver hook); 58 passed (Finitum leaf); 62 passed (FC7 over coupled leaves, 2026-09-05, per test binary in the foreground); 68 passed (W8 K1, 2026-09-07, per test binary in the foreground)
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
 ```
 
@@ -284,8 +360,34 @@ W7 landed (this head): the content-addressed `BlockLinearExecution` steady-runne
 6. DAE index-1 consistent initialization beyond reduced-row, and coupled event persistence --
    still only from a concrete product case. `CoupledSystemOperator` concatenates leaf events
    (`event_count`/`event_values`) but `CoupledExecution` still does not persist event records.
+   W8 K1 (2026-09-07) added the when-algebraic opt-in (no rate solve on an all-differential
+   structure, so C12.9 item 5's barycenter-mass structures can initialize) and the in-memory
+   typed refusal log (`evaluation_refusals`); neither the log nor event records are
+   checkpointed.
 
-## Cross-repo needs (2026-09-05)
+## Cross-repo needs (2026-09-07)
+
+- **Sinbad 7d-2** (what to read so `src/evaluation_failure.rs` shrinks to reading the typed
+  outcome): a typed failure raised inside a Finitum callback reaches Sinbad as
+  `KrasisError::EvaluationRefused { code, origin, message }` from `CoupledExecution::
+  attempt_step` / `attempt_step_with` (after the rollback; never a `Rejected` outcome, so the
+  transient loop must not shrink `dt` on it), from `CoupledExecution::new` (consistent
+  initialization), from `initial_state_from` / `CoupledSystemOperator::initial_state_from`
+  (a `FieldSource::Fallible` datum, located `point (..), t = 0`), and from
+  `BlockLinearExecution::solve` (steady path). `code` is the producer's own (`RUN_*`, or
+  Finitum's `REALIZATION_PROPERTY_UNAVAILABLE` / `REALIZATION_TANGENT_UNAVAILABLE`); `origin` is
+  Finitum's `InputOrigin` display (`provider/<p>`, a slot or expression path verbatim, `<t>
+  (stored table)`); `message` is Finitum's located text ahead of the producer's message. Emit
+  the refusal with that code and origin instead of matching `KrasisError::Solve(message)`
+  strings; `execution.evaluation_refusals()` (`RefusedAttempt { refusal, time, step }`) is the
+  record for the receipt; the transient evidence's `RollbackIdentityReport` / `HistoryReport`
+  carry `evaluation_refusal: Option<EvaluationRefusal>` for a probed attempt that refused
+  typed (absent otherwise, digests unchanged). Optional: `CoupledSystemOperator::
+  with_consistent_initialization_when_algebraic(newton)` in place of
+  `with_consistent_initialization` lets an all-differential structure take the barycenter rule
+  (C12.9 item 5) -- its operator identity differs (`krasis-consistent-init/2`), so switching
+  moves the transient execution identities; with an algebraic row the trajectory is bitwise the
+  same.
 
 - **Finitum**: a multi-instance `SystemRealizationPlan` whose `BlockLayout::new_keyed` carries
   dense `SysVarId`s for a second instance of one model (waits on Scientia `OperatorSystem/2`

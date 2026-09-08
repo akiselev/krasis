@@ -694,3 +694,69 @@ fn nodal_context_refuses_empty_and_inconsistent_coordinates() {
         KrasisError::InconsistentNodalCoordinates { .. }
     ));
 }
+
+#[test]
+fn consistent_initialization_when_algebraic_solves_only_with_an_algebraic_row() {
+    let context = EvaluationContext::reproducible();
+
+    // With an algebraic row the opt-in behaves exactly as the always-solve path: the same
+    // consistent rate, the same untouched state, the same refusal of an inconsistent algebraic
+    // row; only the identity differs.
+    let (realization, layout) = linear_diffusion_realization();
+    let always = CoupledOperator::new(realization.clone(), &layout)
+        .unwrap()
+        .with_consistent_initialization(diffusion_mask(), NewtonConfig::default())
+        .unwrap();
+    let when = CoupledOperator::new(realization, &layout)
+        .unwrap()
+        .with_consistent_initialization_when_algebraic(diffusion_mask(), NewtonConfig::default())
+        .unwrap();
+    assert_ne!(always.identity(), when.identity());
+    assert!(when.identity().contains(":consistent-init="));
+    assert_eq!(when.row_kinds(), Some(diffusion_mask().as_slice()));
+    let mut state = consistent_ic();
+    DaeOperator::make_initial_state_consistent(&when, &context, 0.0, &mut state).unwrap();
+    assert_eq!(state, consistent_ic());
+    assert_eq!(
+        when.solve_consistent_state_rate(&context, 0.0, &consistent_ic())
+            .unwrap(),
+        always
+            .solve_consistent_state_rate(&context, 0.0, &consistent_ic())
+            .unwrap()
+    );
+    let mut inconsistent = consistent_ic();
+    inconsistent[BOUNDARY_ROWS[0]] = 0.5;
+    let refused_when =
+        DaeOperator::make_initial_state_consistent(&when, &context, 0.0, &mut inconsistent.clone())
+            .unwrap_err();
+    let refused_always = DaeOperator::make_initial_state_consistent(
+        &always,
+        &context,
+        0.0,
+        &mut inconsistent.clone(),
+    )
+    .unwrap_err();
+    assert_eq!(refused_when, refused_always);
+
+    // An all-differential mask on the single-model P1 plan (whose barycenter consistent mass
+    // is rank-deficient, C11.8): nothing is solved, the residual is evaluated once and the
+    // state is untouched.
+    let (realization, layout, _) = linear_reaction_realization(1);
+    let dimension = realization.dimension();
+    let all_differential = vec![RowKind::Differential; dimension];
+    let too_long = vec![RowKind::Differential; dimension + 1];
+    assert!(matches!(
+        CoupledOperator::new(realization.clone(), &layout)
+            .unwrap()
+            .with_consistent_initialization_when_algebraic(too_long, NewtonConfig::default()),
+        Err(KrasisError::ConsistentInitializationMaskLength { .. })
+    ));
+    let when = CoupledOperator::new(realization, &layout)
+        .unwrap()
+        .with_consistent_initialization_when_algebraic(all_differential, NewtonConfig::default())
+        .unwrap();
+    let before: Vec<f64> = (0..dimension).map(|index| 0.5 + index as f64).collect();
+    let mut state = before.clone();
+    DaeOperator::make_initial_state_consistent(&when, &context, 0.0, &mut state).unwrap();
+    assert_eq!(state, before);
+}

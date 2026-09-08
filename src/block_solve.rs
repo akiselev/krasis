@@ -271,7 +271,9 @@ impl<'op, Op: BlockLinearOperator + OperatorIdentity> BlockLinearExecution<'op, 
             Ok(outcome) => outcome,
             Err(error) => {
                 self.state.rollback()?;
-                return Err(KrasisError::Solve(error.to_string()));
+                // A typed evaluation failure raised by the operator's action (a Finitum
+                // callback refusing) is reported as itself after the rollback.
+                return Err(crate::coupled::krasis_solve_error(error));
             }
         };
         if !report.converged {

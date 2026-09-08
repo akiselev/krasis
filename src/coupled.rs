@@ -24,10 +24,69 @@ pub enum RowKind {
     Algebraic,
 }
 
+/// When a recorded consistent initialization performs its index-1 rate solve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum RateSolvePolicy {
+    /// Always solve for the differential rows' rate (`with_consistent_initialization`).
+    Always,
+    /// Solve only when the mask marks at least one row algebraic; an all-differential
+    /// structure evaluates its residual once at the initial state and never inverts its mass
+    /// (`with_consistent_initialization_when_algebraic`).
+    WhenAlgebraic,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ConsistentInitialization {
     pub(crate) mask: Vec<RowKind>,
     pub(crate) newton: NewtonConfig,
+    pub(crate) policy: RateSolvePolicy,
+}
+
+/// A Methodus algorithm failure as Krasis reports it after rolling back: a typed evaluation
+/// failure keeps its producer code and origin ([`KrasisError::EvaluationRefused`]); every other
+/// failure is the flat [`KrasisError::Solve`] message it always was.
+pub(crate) fn krasis_solve_error(error: SolveError) -> KrasisError {
+    match error {
+        SolveError::Numeric(numeric) => krasis_numeric_error(numeric),
+        other => KrasisError::Solve(other.to_string()),
+    }
+}
+
+/// A Methodus operator failure as Krasis reports it; see [`krasis_solve_error`].
+pub(crate) fn krasis_numeric_error(error: NumericError) -> KrasisError {
+    match error {
+        NumericError::Evaluation {
+            code,
+            origin,
+            message,
+        } => KrasisError::EvaluationRefused {
+            code,
+            origin,
+            message,
+        },
+        other => KrasisError::Solve(other.to_string()),
+    }
+}
+
+/// The inverse mapping at a Methodus boundary Krasis itself implements
+/// (`make_initial_state_consistent`): a typed refusal goes back out as
+/// [`NumericError::Evaluation`] with code and origin intact, anything else as the flat
+/// [`NumericError::Operator`] message it always was.
+pub(crate) fn methodus_operator_error(error: KrasisError) -> NumericError {
+    match error {
+        KrasisError::EvaluationRefused {
+            code,
+            origin,
+            message,
+        } => NumericError::Evaluation {
+            code,
+            origin,
+            message,
+        },
+        other => NumericError::Operator {
+            message: other.to_string(),
+        },
+    }
 }
 
 /// A Krasis-composed DAE operator that [`CoupledExecution`] can enclose in a transaction:
@@ -202,7 +261,7 @@ impl CoupledOperator {
     /// Without this, [`DaeOperator::make_initial_state_consistent`] stays the inherited no-op,
     /// identical to today's behavior.
     pub fn with_consistent_initialization(
-        mut self,
+        self,
         mask: Vec<RowKind>,
         newton: NewtonConfig,
     ) -> Result<Self, KrasisError> {
@@ -212,12 +271,49 @@ impl CoupledOperator {
                 expected: self.dimension(),
             });
         }
+        self.record_consistent_initialization(mask, newton, RateSolvePolicy::Always)
+    }
+
+    /// As [`Self::with_consistent_initialization`], except that the index-1 rate solve runs
+    /// only when `mask` marks at least one row algebraic. An all-differential mask has no
+    /// algebraic constraint an initial state could violate, so
+    /// [`DaeOperator::make_initial_state_consistent`] evaluates the residual once at the
+    /// initial state and zero rate (a typed evaluation failure surfaces there, as on the solve
+    /// path) and never inverts the mass on any row -- a structure whose consistent P1 mass is
+    /// rank-deficient under the barycenter rule (C12.9 item 5) no longer refuses at
+    /// initialization. With an algebraic row the behavior is exactly the existing path's.
+    /// The identity differs from the always-solve path's (`krasis-consistent-init/2` payload),
+    /// and [`Self::solve_consistent_state_rate`] is unchanged: it always solves.
+    pub fn with_consistent_initialization_when_algebraic(
+        self,
+        mask: Vec<RowKind>,
+        newton: NewtonConfig,
+    ) -> Result<Self, KrasisError> {
+        if mask.len() != self.dimension() {
+            return Err(KrasisError::ConsistentInitializationMaskLength {
+                actual: mask.len(),
+                expected: self.dimension(),
+            });
+        }
+        self.record_consistent_initialization(mask, newton, RateSolvePolicy::WhenAlgebraic)
+    }
+
+    fn record_consistent_initialization(
+        mut self,
+        mask: Vec<RowKind>,
+        newton: NewtonConfig,
+        policy: RateSolvePolicy,
+    ) -> Result<Self, KrasisError> {
         self.identity = format!(
             "{}:consistent-init={}",
             self.identity,
-            consistent_initialization_identity(&mask, &newton)
+            consistent_initialization_identity(&mask, &newton, policy)
         );
-        self.consistent_initialization = Some(ConsistentInitialization { mask, newton });
+        self.consistent_initialization = Some(ConsistentInitialization {
+            mask,
+            newton,
+            policy,
+        });
         Ok(self)
     }
 
@@ -244,11 +340,70 @@ impl CoupledOperator {
         })?;
         solve_consistent_state_rate_for(self, &config.mask, &config.newton, context, time, state)
     }
+}
 
-    fn numeric_error(error: finitum::FinitumError) -> NumericError {
-        NumericError::Operator {
-            message: error.to_string(),
-        }
+/// [`DaeOperator::make_initial_state_consistent`] for every Krasis-composed operator: a no-op
+/// without a recorded mask; otherwise the index-1 rate solve
+/// ([`solve_consistent_state_rate_for`]) validating that a consistent rate exists at `time`,
+/// skipped under [`RateSolvePolicy::WhenAlgebraic`] when no row is algebraic, in which case the
+/// residual is evaluated once at `state` with zero rate and nothing is inverted. Never adjusts
+/// `state`. A typed evaluation failure raised by the operator on either path goes back out as
+/// [`NumericError::Evaluation`] with its code and origin intact.
+pub(crate) fn make_initial_state_consistent_for<O: DaeOperator + ?Sized>(
+    operator: &O,
+    config: Option<&ConsistentInitialization>,
+    context: &EvaluationContext,
+    time: f64,
+    state: &[f64],
+) -> Result<(), NumericError> {
+    let Some(config) = config else {
+        // No mask was recorded at construction: identical to the inherited no-op.
+        return Ok(());
+    };
+    let solve = match config.policy {
+        RateSolvePolicy::Always => true,
+        RateSolvePolicy::WhenAlgebraic => config
+            .mask
+            .iter()
+            .any(|row| matches!(row, RowKind::Algebraic)),
+    };
+    if solve {
+        // Never adjusts `state`, only the (discarded) state rate; it validates that a
+        // consistent state rate exists at `time`, refusing early rather than at the first BDF
+        // step.
+        return solve_consistent_state_rate_for(
+            operator,
+            &config.mask,
+            &config.newton,
+            context,
+            time,
+            state,
+        )
+        .map(|_| ())
+        .map_err(methodus_operator_error);
+    }
+    // Every row is differential: there is no algebraic constraint the initial state could
+    // violate, so there is nothing to validate by a rate solve, and whether the mass is
+    // invertible is the BDF step's own Newton system, not an initialization refusal. One
+    // residual evaluation surfaces a typed evaluation failure at initialization exactly as the
+    // solve path does.
+    let dimension = operator.dimension();
+    if state.len() != dimension {
+        return Err(NumericError::DimensionMismatch {
+            operation: "consistent initialization state".into(),
+            expected: dimension,
+            actual: state.len(),
+        });
+    }
+    let zero_rate = vec![0.0; dimension];
+    let mut residual = vec![0.0; dimension];
+    operator.residual(context, time, state, &zero_rate, &mut residual)?;
+    match residual.iter().position(|value| !value.is_finite()) {
+        Some(index) => Err(NumericError::NonFinite {
+            operation: "consistent initialization residual".into(),
+            index,
+        }),
+        None => Ok(()),
     }
 }
 
@@ -387,8 +542,8 @@ pub(crate) fn solve_consistent_state_rate_for<O: DaeOperator + ?Sized>(
             differential_rows: &differential_rows,
         };
         let initial_guess = vec![0.0; differential_rows.len()];
-        let report = solve_newton(&wrapper, context, &initial_guess, newton)
-            .map_err(|error| KrasisError::Solve(error.to_string()))?;
+        let report =
+            solve_newton(&wrapper, context, &initial_guess, newton).map_err(krasis_solve_error)?;
         if !report.converged {
             return Err(KrasisError::Solve(
                 "consistent initialization Newton solve did not converge".into(),
@@ -413,7 +568,7 @@ pub(crate) fn solve_consistent_state_rate_for<O: DaeOperator + ?Sized>(
             let mut residual = vec![0.0; dimension];
             operator
                 .residual(context, time, state, &state_rate, &mut residual)
-                .map_err(|error| KrasisError::Solve(error.to_string()))?;
+                .map_err(krasis_numeric_error)?;
             for &row in &algebraic_rows {
                 if residual[row].abs() > newton.absolute_tolerance {
                     return Err(KrasisError::InvalidCoupling(format!(
@@ -433,6 +588,7 @@ pub(crate) fn solve_consistent_state_rate_for<O: DaeOperator + ?Sized>(
 pub(crate) fn consistent_initialization_identity(
     mask: &[RowKind],
     newton: &NewtonConfig,
+    policy: RateSolvePolicy,
 ) -> String {
     #[derive(Serialize)]
     struct Payload<'a> {
@@ -440,12 +596,29 @@ pub(crate) fn consistent_initialization_identity(
         mask: &'a [RowKind],
         newton: &'a NewtonConfig,
     }
+    #[derive(Serialize)]
+    struct PolicyPayload<'a> {
+        schema: &'static str,
+        mask: &'a [RowKind],
+        newton: &'a NewtonConfig,
+        policy: &'static str,
+    }
 
-    let bytes = serde_json::to_vec(&Payload {
-        schema: "krasis-consistent-init/1",
-        mask,
-        newton,
-    })
+    // The always-solve payload is the `/1` payload it has always been, so every existing
+    // identity is unchanged; the when-algebraic policy is a distinct `/2` payload.
+    let bytes = match policy {
+        RateSolvePolicy::Always => serde_json::to_vec(&Payload {
+            schema: "krasis-consistent-init/1",
+            mask,
+            newton,
+        }),
+        RateSolvePolicy::WhenAlgebraic => serde_json::to_vec(&PolicyPayload {
+            schema: "krasis-consistent-init/2",
+            mask,
+            newton,
+            policy: "when-algebraic",
+        }),
+    }
     .expect("consistent-initialization identity payload is serializable");
     format!("blake3:{}", blake3::hash(&bytes).to_hex())
 }
@@ -465,7 +638,7 @@ impl NonlinearOperator for CoupledOperator {
         // Time-dependent boundary/material behavior must use the DAE implementation below.
         self.realization
             .residual(0.0, state, &vec![0.0; self.dimension()], output)
-            .map_err(Self::numeric_error)
+            .map_err(NumericError::from)
     }
 
     fn jacobian_vector_product(
@@ -478,7 +651,7 @@ impl NonlinearOperator for CoupledOperator {
         let zero = vec![0.0; self.dimension()];
         self.realization
             .jacobian_vector_product(0.0, state, &zero, direction, &zero, output)
-            .map_err(Self::numeric_error)
+            .map_err(NumericError::from)
     }
 }
 
@@ -503,7 +676,7 @@ impl DaeOperator for CoupledOperator {
     ) -> Result<(), NumericError> {
         self.realization
             .residual(time, state, state_rate, output)
-            .map_err(Self::numeric_error)
+            .map_err(NumericError::from)
     }
 
     fn jacobian_vector_product(
@@ -525,7 +698,7 @@ impl DaeOperator for CoupledOperator {
                 rate_direction,
                 output,
             )
-            .map_err(Self::numeric_error)
+            .map_err(NumericError::from)
     }
 
     fn make_initial_state_consistent(
@@ -534,18 +707,13 @@ impl DaeOperator for CoupledOperator {
         time: f64,
         state: &mut [f64],
     ) -> Result<(), NumericError> {
-        if self.consistent_initialization.is_none() {
-            // No mask was recorded at construction: identical to the inherited no-op.
-            return Ok(());
-        }
-        // This never adjusts `state`, only the (discarded) state rate; it exists to validate
-        // that a consistent state rate exists at `time`, refusing early rather than at the
-        // first BDF step.
-        self.solve_consistent_state_rate(context, time, state)
-            .map(|_| ())
-            .map_err(|error| NumericError::Operator {
-                message: error.to_string(),
-            })
+        make_initial_state_consistent_for(
+            self,
+            self.consistent_initialization.as_ref(),
+            context,
+            time,
+            state,
+        )
     }
 }
 
@@ -555,6 +723,29 @@ pub struct CoupledCheckpoint {
     pub operator_identity: String,
     pub state: Checkpoint,
     pub integrator: BdfState,
+}
+
+/// One typed evaluation failure as a Krasis transaction reports it (W8 decision 3): the
+/// producer's code, origin and located message verbatim -- the same values
+/// [`KrasisError::EvaluationRefused`] carries -- as verification reports and the execution's
+/// transaction log record it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvaluationRefusal {
+    pub code: String,
+    pub origin: String,
+    pub message: String,
+}
+
+/// One entry of a [`CoupledExecution`]'s transaction log: the attempt that ran into a typed
+/// evaluation failure, with the committed time it started from and the step it attempted. The
+/// attempt was rolled back and not retried. The log is per execution and in memory: it is not
+/// part of [`CoupledCheckpoint`], so a checkpoint taken after a refusal is byte-identical to one
+/// taken before it, and [`CoupledExecution::restore`] leaves it alone.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RefusedAttempt {
+    pub refusal: EvaluationRefusal,
+    pub time: f64,
+    pub step: f64,
 }
 
 impl TransactionalOperator for CoupledOperator {
@@ -579,6 +770,7 @@ pub struct CoupledExecution<Op: TransactionalOperator = CoupledOperator> {
     operator: Op,
     state: SimulationState,
     integrator: BdfState,
+    refusals: Vec<RefusedAttempt>,
 }
 
 impl<Op: TransactionalOperator> CoupledExecution<Op> {
@@ -603,15 +795,26 @@ impl<Op: TransactionalOperator> CoupledExecution<Op> {
             ));
         }
         let values = state.committed_vector()?;
+        // A typed evaluation failure raised while the operator validates consistency (its
+        // `make_initial_state_consistent`) is reported as itself, never flattened.
         let integrator = BdfState::initialize(&operator, context, state.time(), values)
-            .map_err(|error| KrasisError::Solve(error.to_string()))?;
+            .map_err(krasis_numeric_error)?;
         let execution = Self {
             operator,
             state,
             integrator,
+            refusals: Vec::new(),
         };
         execution.validate_synchronized()?;
         Ok(execution)
+    }
+
+    /// The transaction log of typed evaluation refusals this execution's attempts ran into, in
+    /// order (W8 decision 3): each is the [`KrasisError::EvaluationRefused`] the attempt
+    /// returned after rolling back, with the committed time and step it was attempting. Empty
+    /// until one occurs; not part of the checkpoint.
+    pub fn evaluation_refusals(&self) -> &[RefusedAttempt] {
+        &self.refusals
     }
 
     pub fn operator(&self) -> &Op {
@@ -628,13 +831,21 @@ impl<Op: TransactionalOperator> CoupledExecution<Op> {
 
     /// Attempt one Methodus BDF step inside the Krasis trial transaction, with the dense Newton
     /// solve `bdf_step` runs from `config.newton`.
+    ///
+    /// A typed evaluation failure raised by the operator during the attempt (a constitutive
+    /// law, an external input or a sampled datum refusing with its own code and origin) is
+    /// returned as [`KrasisError::EvaluationRefused`] after the trial is rolled back and is
+    /// recorded in [`Self::evaluation_refusals`]; it is never a `Rejected` outcome, so no
+    /// caller retries it with a smaller step, and Methodus makes no further Newton attempt
+    /// inside the step (an unsupported law does not become supported by shrinking `dt`). A
+    /// non-finite residual keeps its existing disposition (Methodus's damping and step control).
     pub fn attempt_step(
         &mut self,
         context: &EvaluationContext,
         step: f64,
         config: &BdfConfig,
     ) -> Result<StepOutcome, KrasisError> {
-        self.transact_step(|operator, integrator| {
+        self.transact_step(step, |operator, integrator| {
             bdf_step(operator, context, integrator, step, config)
         })
     }
@@ -644,7 +855,7 @@ impl<Op: TransactionalOperator> CoupledExecution<Op> {
     /// matrix-free inexact Newton over the step's Jacobian action, a `BlockNewton` for
     /// partitioned Gauss-Seidel/Jacobi iteration over the operator's block layout inside the
     /// step, or `DenseNewton`. `config.newton` is not consulted; the commit/rollback
-    /// protocol is exactly [`Self::attempt_step`]'s.
+    /// protocol, including the typed evaluation refusal, is exactly [`Self::attempt_step`]'s.
     pub fn attempt_step_with(
         &mut self,
         context: &EvaluationContext,
@@ -652,16 +863,19 @@ impl<Op: TransactionalOperator> CoupledExecution<Op> {
         config: &BdfConfig,
         solver: &dyn NonlinearSolver,
     ) -> Result<StepOutcome, KrasisError> {
-        self.transact_step(|operator, integrator| {
+        self.transact_step(step, |operator, integrator| {
             bdf_step_with(operator, context, integrator, step, config, solver)
         })
     }
 
     /// One BDF attempt enclosed in `begin_trial` / `commit` / `rollback`: an accepted step
     /// commits the new values at the step's time; a rejected step or a solver error rolls the
-    /// trial back and leaves the committed state and the BDF history untouched.
+    /// trial back and leaves the committed state and the BDF history untouched. A typed
+    /// evaluation failure is rolled back the same way, logged, and returned as
+    /// [`KrasisError::EvaluationRefused`] with the producer's code and origin.
     fn transact_step(
         &mut self,
+        step: f64,
         attempt: impl FnOnce(&Op, &BdfState) -> Result<StepOutcome, SolveError>,
     ) -> Result<StepOutcome, KrasisError> {
         self.validate_synchronized()?;
@@ -670,7 +884,24 @@ impl<Op: TransactionalOperator> CoupledExecution<Op> {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.state.rollback()?;
-                return Err(KrasisError::Solve(error.to_string()));
+                let error = krasis_solve_error(error);
+                if let KrasisError::EvaluationRefused {
+                    code,
+                    origin,
+                    message,
+                } = &error
+                {
+                    self.refusals.push(RefusedAttempt {
+                        refusal: EvaluationRefusal {
+                            code: code.clone(),
+                            origin: origin.clone(),
+                            message: message.clone(),
+                        },
+                        time: self.state.time(),
+                        step,
+                    });
+                }
+                return Err(error);
             }
         };
         match &outcome {

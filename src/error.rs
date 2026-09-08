@@ -101,4 +101,15 @@ pub enum KrasisError {
         "consistent-initialization mask has {actual} rows, expected {expected} to match the operator dimension"
     )]
     ConsistentInitializationMaskLength { actual: usize, expected: usize },
+    /// A typed evaluation failure (W8 decision 3) that reached a Krasis transaction or
+    /// initialization: the producer's own refusal code and origin, carried verbatim from
+    /// Finitum's `InputEvaluationError` through Methodus's `NumericError::Evaluation`. The
+    /// attempt it interrupted was rolled back and is never retried with a smaller step or
+    /// another Newton attempt; "non-finite" is never the reported cause.
+    #[error("{code} at {origin}: {message}")]
+    EvaluationRefused {
+        code: String,
+        origin: String,
+        message: String,
+    },
 }

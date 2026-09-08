@@ -14,7 +14,9 @@ use methodus::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{CoupledExecution, EventDirection, FinitumRealization, TransactionalOperator};
+use crate::{
+    CoupledExecution, EvaluationRefusal, EventDirection, FinitumRealization, TransactionalOperator,
+};
 
 /// `/2` (W7): a report binds one Finitum source per realization the operator is built over
 /// (`finitum_sources`, in operator order) instead of `/1`'s single optional source, so the same
@@ -237,6 +239,12 @@ pub struct RollbackIdentityReport {
     pub report_digest: String,
     pub binding: VerificationBinding,
     pub disposition: AttemptDisposition,
+    /// The typed evaluation refusal the probed attempt ran into when `disposition` is
+    /// `SolverError` because of one (W8 decision 3): the producer's code and origin, as the
+    /// execution logged it. Absent otherwise, and then absent from the serialized report, so
+    /// every earlier report digest is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_refusal: Option<EvaluationRefusal>,
     pub checkpoint_before_digest: String,
     pub checkpoint_after_digest: String,
     pub byte_identical: bool,
@@ -316,6 +324,11 @@ pub struct HistoryReport {
     pub field_history_depths: Vec<(String, usize)>,
     pub synchronized: bool,
     pub rejected_attempt: AttemptDisposition,
+    /// The typed evaluation refusal the rejection attempt ran into when `rejected_attempt` is
+    /// `SolverError` because of one (W8 decision 3); absent otherwise, and then absent from
+    /// the serialized report, so every earlier report digest is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_refusal: Option<EvaluationRefusal>,
     pub checkpoint_before_rejection_digest: String,
     pub checkpoint_after_rejection_digest: String,
     pub rejection_byte_identical: bool,
@@ -534,9 +547,13 @@ pub fn check_rollback_identity<Op: TransactionalOperator>(
     let binding = execution_binding(execution, context, &(step, config), finitum_verification)?;
     let mut candidate = execution.clone();
     let before = checkpoint_bytes(&candidate)?;
+    let mut evaluation_refusal = None;
     let disposition = match candidate.attempt_step(context, step, config) {
         Ok(StepOutcome::Rejected(_)) => AttemptDisposition::Rejected,
-        Err(_) => AttemptDisposition::SolverError,
+        Err(error) => {
+            evaluation_refusal = attempt_refusal(&candidate, &error);
+            AttemptDisposition::SolverError
+        }
         Ok(StepOutcome::Accepted(_)) => AttemptDisposition::UnexpectedAccepted,
     };
     let after = checkpoint_bytes(&candidate)?;
@@ -548,6 +565,7 @@ pub fn check_rollback_identity<Op: TransactionalOperator>(
         report_digest: String::new(),
         binding,
         disposition,
+        evaluation_refusal,
         checkpoint_before_digest: digest(&before),
         checkpoint_after_digest: digest(&after),
         byte_identical,
@@ -891,9 +909,13 @@ pub fn check_history_and_rejection<Op: TransactionalOperator>(
         .iter()
         .all(|(_, depth)| *depth == accepted_steps.min(checkpoint.state.history_limit));
     let before = checkpoint_bytes(&candidate)?;
+    let mut evaluation_refusal = None;
     let rejected_attempt = match candidate.attempt_step(context, step, rejection_config) {
         Ok(StepOutcome::Rejected(_)) => AttemptDisposition::Rejected,
-        Err(_) => AttemptDisposition::SolverError,
+        Err(error) => {
+            evaluation_refusal = attempt_refusal(&candidate, &error);
+            AttemptDisposition::SolverError
+        }
         Ok(StepOutcome::Accepted(_)) => AttemptDisposition::UnexpectedAccepted,
     };
     let after = checkpoint_bytes(&candidate)?;
@@ -909,6 +931,7 @@ pub fn check_history_and_rejection<Op: TransactionalOperator>(
         field_history_depths,
         synchronized,
         rejected_attempt,
+        evaluation_refusal,
         checkpoint_before_rejection_digest: digest(&before),
         checkpoint_after_rejection_digest: digest(&after),
         rejection_byte_identical,
@@ -1341,12 +1364,48 @@ fn require_identity(identity: &str, label: &str) -> Result<String, VerificationR
     }
 }
 
+/// A Methodus operator failure inside a check: a typed evaluation failure is reported under
+/// the producer's own code with its origin ahead of the message (W8 decision 3); every other
+/// failure is `KRASIS_VERIFY_NUMERIC` as before.
 fn numeric_refusal(error: NumericError) -> VerificationRefusal {
-    refusal("KRASIS_VERIFY_NUMERIC", error.to_string())
+    match error {
+        NumericError::Evaluation {
+            code,
+            origin,
+            message,
+        } => refusal(&code, format!("{origin}: {message}")),
+        other => refusal("KRASIS_VERIFY_NUMERIC", other.to_string()),
+    }
 }
 
+/// A Krasis failure inside a check: a typed evaluation refusal an attempt returned is reported
+/// under the producer's own code with its origin ahead of the message; every other failure is
+/// `KRASIS_VERIFY_STATE` as before.
 fn krasis_refusal(error: crate::KrasisError) -> VerificationRefusal {
-    refusal("KRASIS_VERIFY_STATE", error.to_string())
+    match error {
+        crate::KrasisError::EvaluationRefused {
+            code,
+            origin,
+            message,
+        } => refusal(&code, format!("{origin}: {message}")),
+        other => refusal("KRASIS_VERIFY_STATE", other.to_string()),
+    }
+}
+
+/// The typed refusal a probed attempt ran into, when `error` is one: the record the execution
+/// logged for it (its code and origin are those of `error`).
+fn attempt_refusal<Op: TransactionalOperator>(
+    execution: &CoupledExecution<Op>,
+    error: &crate::KrasisError,
+) -> Option<EvaluationRefusal> {
+    matches!(error, crate::KrasisError::EvaluationRefused { .. })
+        .then(|| {
+            execution
+                .evaluation_refusals()
+                .last()
+                .map(|attempt| attempt.refusal.clone())
+        })
+        .flatten()
 }
 
 fn serialization_refusal(error: serde_json::Error) -> VerificationRefusal {

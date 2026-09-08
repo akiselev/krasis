@@ -21,8 +21,8 @@ pub use block_solve::{
 };
 pub use checkpoint::Checkpoint;
 pub use coupled::{
-    CoupledCheckpoint, CoupledExecution, CoupledOperator, FinitumRealization, RowKind,
-    TransactionalOperator,
+    CoupledCheckpoint, CoupledExecution, CoupledOperator, EvaluationRefusal, FinitumRealization,
+    RefusedAttempt, RowKind, TransactionalOperator,
 };
 pub use coupled_system::{
     CoupledLeaf, CoupledSystemOperator, CouplingArgument, CouplingDependency, CouplingEdge,
