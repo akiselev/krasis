@@ -1,0 +1,149 @@
+   Compiling cadabra-number v0.1.0 (/projects/sinbad/cadabra3/crates/cadabra-number)
+   Compiling scientia v0.1.0 (/projects/sinbad/scientia)
+   Compiling cadabra-math v0.1.0 (/projects/sinbad/cadabra3/crates/cadabra-math)
+   Compiling cadabra-geometry v0.1.0 (/projects/sinbad/cadabra3/crates/cadabra-geometry)
+   Compiling cadabra-brep v0.1.0 (/projects/sinbad/cadabra3/crates/cadabra-brep)
+   Compiling cadabra-provider v0.1.0 (/projects/sinbad/cadabra3/crates/cadabra-provider)
+   Compiling finitum v0.1.0 (/projects/sinbad/finitum)
+   Compiling krasis v0.1.0 (/projects/sinbad/krasis)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 34s
+     Running unittests src/lib.rs (/projects/sinbad/.show-build/debug/deps/krasis-8d6256d8106d0167)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/coupled_execution.rs (/projects/sinbad/.show-build/debug/deps/coupled_execution-e14758fb3cc5a816)
+
+running 5 tests
+test sv0_restart_and_history_refuse_invalid_sequences ... ok
+test real_composition_implements_nonlinear_block_and_dae_derivatives ... ok
+test checkpoint_refuses_same_size_geometry_and_material_changes ... ok
+test accepted_rejected_and_restarted_steps_preserve_transactional_history ... ok
+test sv0_transaction_restart_and_history_reports_are_identity_bound ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.69s
+
+     Running tests/coupled_finitum_system.rs (/projects/sinbad/.show-build/debug/deps/coupled_finitum_system-841368324cccca27)
+
+running 7 tests
+test block_state_layout_binds_the_system_variable_and_finitum_still_refuses_a_keyed_plan ... ok
+test a_reduced_system_leaf_refuses_a_binding_over_other_blocks ... ok
+test prescribed_motion_changes_checkpoint_identity_and_static_identity_stays_exact ... ok
+test finitum_reduced_system_leaves_compose_into_one_transient_dae ... ok
+test initial_state_from_projects_onto_each_leaf_mesh ... ok
+test fc7_sources_over_two_reduced_system_leaves_roll_back_and_restart_bit_exactly has been running for over 60 seconds
+test newton_inside_bdf_advances_two_finitum_leaves_through_the_transaction has been running for over 60 seconds
+test newton_inside_bdf_advances_two_finitum_leaves_through_the_transaction ... ok
+test fc7_sources_over_two_reduced_system_leaves_roll_back_and_restart_bit_exactly ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 159.72s
+
+     Running tests/coupled_system.rs (/projects/sinbad/.show-build/debug/deps/coupled_system-38b4566831e4303b)
+
+running 13 tests
+test a_one_way_coupling_is_solved_exactly_by_one_ordered_sweep ... ok
+test fc10_methodus_advances_the_cross_dialect_system_without_method_specific_policy ... ok
+test fc10_explicit_off_diagonal_blocks_form_a_real_bidirectional_dae ... ok
+test composed_residual_is_leaf_residuals_plus_edge_actions_and_the_jvp_is_consistent ... ok
+test the_coupling_graph_orders_dependencies_first_and_detects_cycles ... ok
+test consistent_initialization_is_solved_over_the_composed_residual ... ok
+test fc10_identity_is_canonical_and_covers_coupling_matrices ... ok
+test checkpoint_restart_reproduces_the_composed_trajectory_bitwise ... ok
+test newton_inside_bdf_reproduces_the_manufactured_solution_at_first_and_second_order ... ok
+test newton_krylov_and_partitioned_newton_inside_bdf_agree_with_dense_newton ... ok
+test identity_is_canonical_and_covers_leaves_edges_and_edge_content ... ok
+test composition_refuses_malformed_leaves_and_edges ... ok
+test partitioned_gauss_seidel_and_jacobi_agree_with_monolithic_newton ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.04s
+
+     Running tests/e6_block_linear.rs (/projects/sinbad/.show-build/debug/deps/e6_block_linear-63b90f15ab669af4)
+
+running 8 tests
+test construction_refuses_a_block_count_mismatch ... ok
+test restore_refuses_a_checkpoint_from_a_different_operator_identity ... ok
+test a_non_converged_solve_never_commits_and_state_stays_untouched ... ok
+test construction_refuses_a_dimension_mismatched_state ... ok
+test a_projector_with_a_non_minres_algorithm_is_refused_before_any_solve ... ok
+test checkpoint_identity_distinguishes_operators_of_equal_shape_but_different_content ... ok
+test nullspace_projector_path_converges_the_declared_reduced_residual ... ok
+test minres_reaches_the_expected_solution_with_rollback_restart_and_history_evidence ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+     Running tests/fc7_coupled_leaf.rs (/projects/sinbad/.show-build/debug/deps/fc7_coupled_leaf-5215383080441a33)
+
+running 1 test
+test one_leaf_reduced_system_sources_match_the_coupled_operator_path has been running for over 60 seconds
+test one_leaf_reduced_system_sources_match_the_coupled_operator_path ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 74.04s
+
+     Running tests/gx_d1.rs (/projects/sinbad/.show-build/debug/deps/gx_d1-0e4d13fb2bca7dc5)
+
+running 15 tests
+test initial_state_from_projects_a_vector_valued_block ... ok
+test initial_state_from_refuses_dimension_mismatch_and_non_finite_values ... ok
+test nodal_context_refuses_empty_and_inconsistent_coordinates ... ok
+test initial_state_from_projects_constant_and_sampled_sources ... ok
+test state_binding_is_total_and_injective_and_resolves_both_directions ... ok
+test initial_state_from_refuses_missing_extra_and_duplicate_blocks ... ok
+test state_binding_refuses_unknown_incomplete_and_duplicate_bindings ... ok
+test coupled_operator_refuses_a_binding_whose_blocks_do_not_match_the_layout ... ok
+test coupled_operator_with_bindings_changes_identity_additively ... ok
+test make_initial_state_consistent_is_a_no_op_without_a_recorded_mask ... ok
+test make_initial_state_consistent_solves_the_rate_and_leaves_state_untouched ... ok
+test consistent_initialization_mask_length_is_validated_at_construction ... ok
+test consistent_state_rate_matches_the_analytic_solution ... ok
+test consistent_initialization_refuses_an_inconsistent_algebraic_row ... ok
+test consistent_initialization_when_algebraic_solves_only_with_an_algebraic_row ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/sc_w1_steady_reroute.rs (/projects/sinbad/.show-build/debug/deps/sc_w1_steady_reroute-80254924fe8064fd)
+
+running 4 tests
+test reduced_system_identity_covers_the_constraint_set ... ok
+test a_methodus_refusal_rolls_back_and_surfaces_typed ... ok
+test gmres_through_krasis_is_bit_identical_on_the_unsigned_system ... ok
+test minres_through_krasis_is_bit_identical_to_the_direct_methodus_solve ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+
+     Running tests/sv0_verification.rs (/projects/sinbad/.show-build/debug/deps/sv0_verification-3e7d73d0d7955818)
+
+running 6 tests
+test malformed_probe_identities_and_dimensions_refuse ... ok
+test cross_derivative_tolerance_is_applied_per_target_component ... ok
+test nonconverged_strategy_is_not_laundered_as_agreement ... ok
+test generic_event_report_is_truthfully_scoped_and_directional ... ok
+test rejected_event_attempt_emits_nothing_and_nonfinite_events_refuse ... ok
+test isolated_cross_derivatives_and_counted_strategies_are_reusable ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/transactions.rs (/projects/sinbad/.show-build/debug/deps/transactions-c825902a77d43f55)
+
+running 5 tests
+test constitutive_state_uses_the_same_commit_and_rollback_boundary ... ok
+test state_structure_is_locked_during_a_trial ... ok
+test step_overflow_leaves_the_trial_uncommitted ... ok
+test malformed_restore_does_not_partially_mutate_state ... ok
+test rejected_trial_is_bit_identical_and_checkpoint_restores ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/w8_typed_failures.rs (/projects/sinbad/.show-build/debug/deps/w8_typed_failures-02c1648e96a5ded4)
+
+running 6 tests
+test initial_state_from_evaluates_a_fallible_source_at_the_initial_time_and_refuses_typed ... ok
+test a_typed_refusal_during_consistent_initialization_is_typed_from_coupled_execution_new ... ok
+test fallible_patch_preserves_report_identity_and_first_callback_refusal ... ok
+test check_functions_report_the_producer_code_when_the_operator_refuses ... ok
+test a_typed_constitutive_refusal_is_the_transaction_outcome_rolled_back_after_one_attempt ... ok
+test consistent_initialization_when_algebraic_solves_only_with_an_algebraic_row has been running for over 60 seconds
+test consistent_initialization_when_algebraic_solves_only_with_an_algebraic_row ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 127.66s
+

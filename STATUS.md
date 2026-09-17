@@ -1,8 +1,19 @@
 # Krasis status
 
-Updated: 2026-09-08
-Committed base: `39b98f3` (prescribed-motion checkpoint identity).
-Milestone: W8 F3 consumer deletion and fallible patch verification forwarding.
+SC-W2 first matching-interface implementation (2026-09-17):
+ConnectedSystemOperator composes checked Finitum affine trace elimination with
+CoupledSystemOperator, including state/rate expansion, residual transpose
+restriction and the corresponding JVP. Leaf realization identity and extent
+must match the proof. Sinbad consumes it inside a steady trial/commit transaction.
+Nonmatching, transient-interface strategies and n-way composition are not claimed.
+Owner gate: 70 tests across 11 targets, fmt, strict all-feature clippy,
+rustdoc and doctests pass with unchanged source hashes. Consumer final acceptance
+is pending. Finitum dependency: `2de7dd8cfcf173f364114728c590402ccc4d820c`.
+Evidence: `docs/validation/2026-09-17-sc-w2/`.
+
+
+Updated: 2026-09-17
+Milestone: SC-W2 first matching-interface residual and JVP composition.
 
 ## Ownership
 

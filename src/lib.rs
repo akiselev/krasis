@@ -1,5 +1,7 @@
 //! Coupled field state and transactional simulation runtime.
 
+mod connected;
+pub use connected::ConnectedSystemOperator;
 mod binding;
 mod block_binding;
 mod block_solve;
