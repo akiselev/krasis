@@ -1,10 +1,11 @@
 # Krasis status
 
-2026-09-18 implementation in acceptance:
-SHOW-3 / SC-W3 candidate: matching multi-component DAE composition, consistent initialization and differential/algebraic trace-row classification. Connected diagonal sums are available for independent leaves and simple matching equivalence classes; unsupported classes refuse. Product trajectory/JVP tests pass; complete owner gate pending.
+2026-09-18 bounded implementation accepted:
+SHOW-3 / SC-W3: matching multi-component DAE composition, consistent initialization and differential/algebraic trace-row classification. Connected diagonal sums are available for independent leaves and simple matching equivalence classes; unsupported classes refuse. Product trajectory/JVP tests pass; complete owner gate passed: 70 tests across 11 targets, formatting, check, strict clippy, rustdoc and doctests. Final consumer acceptance passed: 210 tests across 35 targets, with a documented external-fixture target retry and unchanged source.
 
 
-SC-W2 first matching-interface implementation (2026-09-17):
+Historical September 17 checkpoint (superseded by the accepted extension above):
+SC-W2 first matching-interface implementation:
 ConnectedSystemOperator composes checked Finitum affine trace elimination with
 CoupledSystemOperator, including state/rate expansion, residual transpose
 restriction and the corresponding JVP. Leaf realization identity and extent
@@ -148,3 +149,5 @@ stops callback evaluation while preserving the producer refusal.
 - Cross-instance physical interfaces, conservative nonmatching transfer and general coupled
   objective derivatives require their owning-layer implementation and end-to-end evidence;
   generic leaf composition alone establishes none of those scientific claims.
+
+Final cross-repository evidence: [September 18 acceptance](../sinbad/docs/validation/2026-09-18-assembly/README.md).
