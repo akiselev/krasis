@@ -1,5 +1,9 @@
 # Krasis status
 
+2026-09-18 implementation in acceptance:
+SHOW-3 / SC-W3 candidate: matching multi-component DAE composition, consistent initialization and differential/algebraic trace-row classification. Connected diagonal sums are available for independent leaves and simple matching equivalence classes; unsupported classes refuse. Product trajectory/JVP tests pass; complete owner gate pending.
+
+
 SC-W2 first matching-interface implementation (2026-09-17):
 ConnectedSystemOperator composes checked Finitum affine trace elimination with
 CoupledSystemOperator, including state/rate expansion, residual transpose
