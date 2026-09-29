@@ -1,5 +1,72 @@
 # Krasis status
 
+2026-09-29 SC-W3 package 1/2 landed (partitioned fixed-point transaction):
+`krasis::partitioned` adds a partitioned decomposition over any `methodus::BlockLayout` (serial
+Gauss-Seidel / parallel Jacobi schedule), usable as a standalone steady transaction
+(`PartitionedExecution`, trial/commit/rollback like `BlockLinearExecution`) or plugged into
+`CoupledExecution::attempt_step_with` as a `methodus::NonlinearSolver`
+(`PartitionedFixedPoint`), so it shares the existing BDF transaction and rollback path with
+`BlockNewton`/`NewtonKrylovSolver`. `ConnectedSystemOperator` gained `BlockNonlinearOperator`
+(forwarding to its inner `CoupledSystemOperator`'s leaf-range layout, valid because elimination
+preserves dimension and index), so both `ConnectedSystemOperator` and `CoupledSystemOperator`
+admit the same `partitioned` decomposition per the brief. Existing 70 owner tests are unchanged;
+4 new tests in `tests/sc_w3_partitioned.rs` bring the gate to 74 tests across 12 targets, all
+passing with formatting, `cargo check`, strict all-feature clippy, rustdoc and doctests clean.
+
+Ownership split: Methodus's existing `solve_blocks(.., max_iterations = 1, ..)` is called once
+per sweep (the per-block Newton-with-backtracking algorithm Methodus already owns); Krasis owns
+the outer sweep loop, an **output-based** convergence test (the sup-norm change of the
+schedule-updated state between sweeps -- the exchanged interface data, since no finer per-DOF
+trace decomposition exists at this composition level), fixed relaxation of that exchanged data
+(a vector combination, not a solver algorithm), and two typed refusals recorded as
+`NumericError::Evaluation` (surfacing as `KrasisError::EvaluationRefused`, never a silently
+accepted iterate): `PARTITIONED_DIVERGED` (a sweep's interface change grows beyond the declared
+`divergence_growth` factor relative to the previous sweep's) and `PARTITIONED_MAX_SWEEPS` (an
+implicit iteration exhausts its bound without reaching its declared tolerance). Package 2's
+agreement gate (`tests/sc_w3_partitioned.rs`): a steady two-leaf conduction fixture's serial and
+parallel partitioned solves agree with monolithic Newton within 1e-8; a transient DAE/BDF fixture
+plugged in as the BDF solver agrees with the dense-Newton trajectory within 1e-9 per accepted
+step; a wrong-role (positive-feedback) coupling run under `iteration = implicit` is refused
+typed (`PARTITIONED_DIVERGED` or `PARTITIONED_MAX_SWEEPS`, both observed depending on the
+fixture) rather than committed, and a refused solve leaves the committed state bit-identical to
+before the attempt.
+
+Recorded findings and open items:
+- **A literal `iteration = once` sweep cannot be judged diverging by construction.** Methodus's
+  `solve_blocks` already backtracks each sweep to guarantee its own residual does not grow (it
+  refuses `SolveError::LineSearchFailed` first), and Krasis's divergence test compares a sweep's
+  interface change against the *previous* sweep's, which a lone `Once` sweep has none of. The
+  architecture's "wrong Dirichlet-Neumann roles" instability therefore only surfaces across
+  repeated application: an `Implicit` iteration (demonstrated above) or, for a plugged-in `Once`
+  solver, across repeated BDF steps until a later step's evaluation hits a typed non-finite
+  refusal. This is intrinsic to driving the iteration through Methodus's existing per-sweep
+  algorithm as the brief directs, not a gap in this package.
+- **No iterate acceleration.** Methodus does not yet expose Aitken/IQN acceleration (SV7-F3);
+  `PartitionedIteration::Implicit` offers only plain iteration and the fixed relaxation factor
+  Krasis itself applies (a vector combination). Cross-repo need: once Methodus lands an
+  acceleration primitive over `&[f64]` iterate sequences, `PartitionedConfig` should gain an
+  `acceleration` axis consuming it instead of (or in addition to) fixed relaxation.
+- **`ConnectedSystemOperator` partitioning is wired but not proven against a real matching
+  fixture.** The `BlockNonlinearOperator` impl is real and type-checked (leaf ranges are
+  preserved under elimination: `new`/`new_system` already require
+  `constraints.dof_count() == inner.dimension()`), but no `ConnectionRealizationPlan`-based
+  two-leaf matching-interface fixture exists yet as reusable Krasis test scaffolding, and
+  building one from scratch (mesh pairing, `InterfaceRealization`, elimination) was beyond this
+  package's time budget. Package 2's "own verification source" is therefore the edge-composed
+  `CoupledSystemOperator` two-leaf conduction fixture (`CouplingEdge` exchange), not the
+  constraint-eliminated `ConnectedSystemOperator` matching interface; a literal SC-W2-style
+  matching heat-heat partitioned agreement gate is open, pending either a Finitum-exported
+  reusable matching fixture or a dedicated follow-on package.
+- **The transient (`PartitionedFixedPoint`) report is thinner than the steady one.**
+  `methodus::NonlinearSolver::solve` returns only the generic `methodus::SolveReport`
+  (state, converged, concatenated per-sweep Newton traces); the richer `PartitionedReport`
+  (schedule, relaxation, per-sweep interface norms, disposition) is not recoverable from a
+  BDF-embedded call, exactly as `BlockNewton` and `NewtonKrylovSolver` cannot report their own
+  shape today either. `PartitionedExecution` (steady) returns the full `PartitionedReport`
+  directly.
+- N-way junctions, general per-stratum matching, and nonmatching transient composition (pending
+  Finitum) remain out of scope, as recorded in prior status and `sinbad/ARCHITECTURE.md`.
+
 2026-09-18 bounded implementation accepted:
 SHOW-3 / SC-W3: matching multi-component DAE composition, consistent initialization and differential/algebraic trace-row classification. Connected diagonal sums are available for independent leaves and simple matching equivalence classes; unsupported classes refuse. Product trajectory/JVP tests pass; complete owner gate passed: 70 tests across 11 targets, formatting, check, strict clippy, rustdoc and doctests. Final consumer acceptance passed: 210 tests across 35 targets, with a documented external-fixture target retry and unchanged source.
 
@@ -17,8 +84,8 @@ is pending. Finitum dependency: `2de7dd8cfcf173f364114728c590402ccc4d820c`.
 Evidence: `docs/validation/2026-09-17-sc-w2/`.
 
 
-Updated: 2026-09-17
-Milestone: SC-W2 first matching-interface residual and JVP composition.
+Updated: 2026-09-29
+Milestone: SC-W3 package 1/2, the partitioned fixed-point transaction.
 
 ## Ownership
 

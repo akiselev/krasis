@@ -12,6 +12,7 @@ mod error;
 mod event;
 mod initial;
 mod layout;
+mod partitioned;
 mod state;
 mod verification;
 
@@ -34,6 +35,11 @@ pub use error::KrasisError;
 pub use event::{EventDirection, EventRecord};
 pub use initial::{NodalContext, initial_state_from};
 pub use layout::{BlockId, StateBlock, StateLayout};
+pub use partitioned::{
+    PARTITIONED_DIVERGED, PARTITIONED_MAX_SWEEPS, PartitionedConfig, PartitionedDisposition,
+    PartitionedExecution, PartitionedFixedPoint, PartitionedIteration, PartitionedReport,
+    PartitionedSchedule, PartitionedSolve, SweepReport, run_partitioned,
+};
 pub use state::{ConstitutiveSlot, FieldId, SimulationState, TransactionPhase};
 pub use verification::{
     AttemptDisposition, CrossBlockDerivativeCheck, CrossBlockDerivativeReport, EventDisposition,

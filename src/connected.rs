@@ -4,7 +4,10 @@ use crate::{
     TransactionalOperator,
 };
 use finitum::{ConnectionRealizationPlan, ConstraintSet, ReducedSystemOperator};
-use methodus::{DaeOperator, EvaluationContext, NonlinearOperator, NumericError};
+use methodus::{
+    BlockLayout, BlockNonlinearOperator, DaeOperator, EvaluationContext, NonlinearOperator,
+    NumericError,
+};
 
 #[derive(Clone, Debug)]
 pub struct ConnectedSystemOperator {
@@ -378,5 +381,16 @@ impl TransactionalOperator for ConnectedSystemOperator {
     }
     fn realizations(&self) -> Vec<FinitumRealization<'_>> {
         self.inner.realizations()
+    }
+}
+impl BlockNonlinearOperator for ConnectedSystemOperator {
+    /// The eliminated (algebraic) rows keep their original index in `self.inner`'s state space
+    /// (`new`/`new_system` require `constraints.dof_count() == inner.dimension()`; elimination
+    /// here reassigns a target row's equation, it never removes or reindexes a row), so `inner`'s
+    /// leaf-range block layout partitions this operator's state exactly as it does the
+    /// unconnected composition: a `partitioned` decomposition (SC-W3 package 1) schedules over
+    /// the same leaves whether or not their interfaces are matched and eliminated.
+    fn block_layout(&self) -> &BlockLayout {
+        BlockNonlinearOperator::block_layout(&self.inner)
     }
 }
