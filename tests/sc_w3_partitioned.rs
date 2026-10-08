@@ -9,7 +9,9 @@
 //!   SC-W3 package 2 brief calls the "two-leaf matching heat-heat conduction fixture".
 //! - `two_block_network`: the transient DAE/BDF fixture with a closed-form manufactured solution
 //!   (also owned by `tests/coupled_system.rs`), used here for the transient partitioned-vs-dense
-//!   BDF-step agreement gate and the `iteration = once` divergence demonstration.
+//!   BDF-step agreement gate and its `iteration = once` negative control.
+//! - `TwoBlockLinear`: a four-unknown linear system with a contractive serial splitting and
+//!   irrational coefficients, for the rounding-floor refusal path (no Finitum involved).
 
 use std::sync::Arc;
 
@@ -21,13 +23,14 @@ use finitum::{
 use krasis::{
     BlockId, CoupledExecution, CoupledLeaf, CoupledOperator, CoupledSystemOperator,
     CouplingArgument, CouplingEdge, FieldId, KrasisError, PARTITIONED_DIVERGED,
-    PARTITIONED_MAX_SWEEPS, PartitionedConfig, PartitionedDisposition, PartitionedExecution,
-    PartitionedFixedPoint, PartitionedIteration, PartitionedSchedule, RowKind, SemanticId,
-    SimulationState, StateBinding, StateBlock, StateLayout,
+    PARTITIONED_MAX_SWEEPS, PARTITIONED_REFUSAL_ORIGIN, PartitionedConfig, PartitionedDisposition,
+    PartitionedExecution, PartitionedFixedPoint, PartitionedIteration, PartitionedSchedule,
+    RowKind, SemanticId, SimulationState, StateBinding, StateBlock, StateLayout, run_partitioned,
 };
 use methodus::{
-    BdfConfig, BdfOrder, BlockNonlinearOperator, CsrMatrix, DaeOperator, EvaluationContext,
-    NewtonConfig, NonlinearOperator, StepOutcome, solve_newton,
+    AccelerationMethod, BdfConfig, BdfOrder, BlockLayout, BlockNonlinearOperator, BlockSpec,
+    CsrMatrix, DaeOperator, EvaluationContext, NewtonConfig, NonlinearOperator, NumericError,
+    SolveError, StepOutcome, solve_newton,
 };
 use quantitas::UnitRegistry;
 use scientia::{
@@ -318,11 +321,15 @@ fn two_block_diffusion(epsilon: f64) -> CoupledSystemOperator {
     CoupledSystemOperator::new(vec![hot, cold], edges).unwrap()
 }
 
-/// The same two leaves, with the wrong (positive-feedback) coupling role: both edges carry a
-/// `+strength` sign instead of the stabilizing `-epsilon`, and `strength` is large -- the
-/// architecture's "wrong Dirichlet-Neumann roles" case, here as a coupling-sign/-magnitude
-/// choice rather than a named role (Krasis composes edges, not named roles; role selection is
-/// Sinbad policy per `sinbad/ARCHITECTURE.md` §9).
+/// The same two leaves with the coupling role reversed: both edges carry `+strength` instead of
+/// the stabilizing `-epsilon` -- the architecture's "wrong Dirichlet-Neumann roles" case, here as
+/// a coupling-sign/-magnitude choice rather than a named role (Krasis composes edges, not named
+/// roles; role selection is Sinbad policy per `sinbad/ARCHITECTURE.md` §9). Whether the serial
+/// splitting of this fixture contracts depends on the exchange magnitude alone (its
+/// error-propagation map is the product of the two off-diagonal blocks, so the sign cancels):
+/// its spectral radius is `(strength / s*)^2` with `s*` about 29.4 on this mesh, so strength 6
+/// is a convergent configuration and strength 60 is not. The tests assert the regime they use
+/// independently of the driver (`serial_schedule_spectral_radius`).
 fn two_block_diffusion_wrong_role(strength: f64) -> CoupledSystemOperator {
     let (hot_plan, hot_rows) = diffusion_realization(3, |point| 1.0 + point[0]);
     let (cold_plan, cold_rows) = diffusion_realization(3, |_| 0.0);
@@ -380,6 +387,20 @@ fn max_abs_difference(left: &[f64], right: &[f64]) -> f64 {
         .zip(right)
         .map(|(l, r)| (l - r).abs())
         .fold(0.0, f64::max)
+}
+
+/// A committed all-zero state over the operator's own layout.
+fn zero_state(operator: &CoupledSystemOperator) -> SimulationState {
+    let mut state = SimulationState::new(operator.layout().clone(), 1);
+    for block in operator.layout().blocks() {
+        state
+            .insert_field(
+                FieldId::new(block.id().as_str()),
+                vec![0.0; block.range().len()],
+            )
+            .unwrap();
+    }
+    state
 }
 
 fn implicit_config(
@@ -449,7 +470,7 @@ fn steady_partitioned_transaction_agrees_with_monolithic_newton_for_both_schedul
         );
         // The last sweep's interface (schedule-updated state) change is within the declared
         // tolerance -- the output-based convergence test that gates commit.
-        assert!(report.sweeps.last().unwrap().interface_norm <= 1.0e-10);
+        assert!(report.sweeps.last().unwrap().state_change_norm <= 1.0e-10);
     }
 }
 
@@ -532,17 +553,277 @@ fn partitioned_fixed_point_inside_bdf_agrees_with_dense_newton_per_accepted_step
 }
 
 // -------------------------------------------------------------------------------------------
-// Package 2: `iteration = once` with a wrong coupling role/magnitude refuses as predicted
+// Package 1: a `Once` solver inside BDF is accepted by declaration, not as a projection
 // -------------------------------------------------------------------------------------------
 
 #[test]
-fn iteration_once_with_a_wrong_coupling_role_is_refused_as_predicted() {
-    // The correctly-signed, moderate exchange: `iteration = once` applies its single sweep and
-    // is accepted (splitting error tolerated, not required to match the monolithic solution).
+fn a_once_solver_inside_bdf_is_accepted_by_declaration_but_is_not_a_projection_of_dense_newton() {
+    let operator = two_block_network(0.4);
+    let context = EvaluationContext::reproducible();
+    let step = 0.05;
+    let config = fixed_step_config(BdfOrder::Two, step);
+
+    let mut dense = CoupledExecution::new(
+        operator.clone(),
+        network_initial_state(&operator, 1.0, 0.0),
+        &context,
+    )
+    .unwrap();
+    let layout = BlockNonlinearOperator::block_layout(&operator).clone();
+    let once_config = PartitionedConfig {
+        schedule: PartitionedSchedule::Serial,
+        iteration: PartitionedIteration::Once,
+        newton: implicit_config(PartitionedSchedule::Serial, 1.0e-12, 100).newton,
+        divergence_growth: 10.0,
+    };
+    let solver = PartitionedFixedPoint::new(&layout, &once_config);
+    let mut once = CoupledExecution::new(
+        operator.clone(),
+        network_initial_state(&operator, 1.0, 0.0),
+        &context,
+    )
+    .unwrap();
+
+    let mut worst = 0.0_f64;
+    for _ in 0..12 {
+        let dense_outcome = dense.attempt_step(&context, step, &config).unwrap();
+        let once_outcome = once
+            .attempt_step_with(&context, step, &config, &solver)
+            .unwrap();
+        assert!(
+            matches!(
+                (&dense_outcome, &once_outcome),
+                (StepOutcome::Accepted(_), StepOutcome::Accepted(_))
+            ),
+            "unexpected outcome pair: {dense_outcome:?} / {once_outcome:?}"
+        );
+        worst = worst.max(max_abs_difference(
+            &dense.state().committed_vector().unwrap(),
+            &once.state().committed_vector().unwrap(),
+        ));
+    }
+    assert!(once.evaluation_refusals().is_empty());
+    // The negative control for the implicit agreement gate above: one schedule sweep per step
+    // is accepted (declared regime), and it is demonstrably not dense Newton.
+    assert!(
+        worst > 1.0e-9,
+        "a single sweep per step must not reproduce dense Newton: worst disagreement {worst:e}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// Package 1: configuration and rounding-floor refusals
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn partitioned_acceleration_is_refused_as_invalid_configuration_and_commits_nothing() {
     let operator = two_block_diffusion(0.3);
     let context = EvaluationContext::reproducible();
-    let mut state = SimulationState::new(operator.layout().clone(), 1);
-    for block in operator.layout().blocks() {
+    let dimension = NonlinearOperator::dimension(&operator);
+    let mut config = implicit_config(PartitionedSchedule::Serial, 1.0e-10, 50);
+    config.newton.acceleration = Some(AccelerationMethod::Aitken {
+        initial_factor: 0.5,
+    });
+    let error = run_partitioned(&operator, &context, &vec![0.0; dimension], &config).unwrap_err();
+    assert!(
+        matches!(&error, SolveError::InvalidConfiguration { reason } if reason.contains("acceleration")),
+        "{error:?}"
+    );
+
+    let state = zero_state(&operator);
+    let before = state.committed_vector().unwrap();
+    let mut execution = PartitionedExecution::new(&operator, state).unwrap();
+    let error = execution.solve(&context, &config, 0.0).unwrap_err();
+    assert!(
+        matches!(&error, KrasisError::Solve(message) if message.contains("acceleration")),
+        "{error:?}"
+    );
+    assert_eq!(execution.state().committed_vector().unwrap(), before);
+
+    // Methodus's fixed relaxation is refused the same way: Krasis's `relaxation` is the one axis.
+    config.newton.acceleration = Some(AccelerationMethod::FixedRelaxation { factor: 0.7 });
+    assert!(matches!(
+        run_partitioned(&operator, &context, &vec![0.0; dimension], &config),
+        Err(SolveError::InvalidConfiguration { .. })
+    ));
+}
+
+/// A two-block linear system `J x = b` with a contractive serial splitting and irrational
+/// coefficients (its residual never reaches an exact zero): rounding-floor scaffolding.
+struct TwoBlockLinear {
+    layout: BlockLayout,
+    jacobian: [[f64; 4]; 4],
+    rhs: [f64; 4],
+}
+
+impl TwoBlockLinear {
+    fn new() -> Self {
+        let layout = BlockLayout::new(vec![
+            BlockSpec {
+                name: "p".into(),
+                length: 2,
+                residual_scale: 1.0,
+            },
+            BlockSpec {
+                name: "q".into(),
+                length: 2,
+                residual_scale: 1.0,
+            },
+        ])
+        .unwrap();
+        let s = std::f64::consts::SQRT_2 / 3.0;
+        let jacobian = [
+            [1.0 + std::f64::consts::PI / 10.0, 0.1, s, 0.0],
+            [0.1, 1.3, 0.0, s],
+            [s, 0.0, 1.1, 0.2],
+            [0.0, s, 0.2, 1.0 + std::f64::consts::E / 10.0],
+        ];
+        Self {
+            layout,
+            jacobian,
+            rhs: [1.0 / 3.0, 2.0 / 3.0, -1.0 / 7.0, 0.5],
+        }
+    }
+}
+
+impl NonlinearOperator for TwoBlockLinear {
+    fn dimension(&self) -> usize {
+        4
+    }
+
+    fn residual(
+        &self,
+        _context: &EvaluationContext,
+        state: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), NumericError> {
+        for (row, value) in output.iter_mut().enumerate() {
+            *value = self.jacobian[row]
+                .iter()
+                .zip(state)
+                .map(|(a, x)| a * x)
+                .sum::<f64>()
+                - self.rhs[row];
+        }
+        Ok(())
+    }
+
+    fn jacobian_vector_product(
+        &self,
+        _context: &EvaluationContext,
+        _state: &[f64],
+        direction: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), NumericError> {
+        for (row, value) in output.iter_mut().enumerate() {
+            *value = self.jacobian[row]
+                .iter()
+                .zip(direction)
+                .map(|(a, d)| a * d)
+                .sum();
+        }
+        Ok(())
+    }
+}
+
+impl BlockNonlinearOperator for TwoBlockLinear {
+    fn block_layout(&self) -> &BlockLayout {
+        &self.layout
+    }
+}
+
+#[test]
+fn a_stall_at_the_rounding_floor_is_refused_max_sweeps_never_diverged() {
+    let operator = TwoBlockLinear::new();
+    let context = EvaluationContext::reproducible();
+    // Tolerances no floating-point iterate can meet: the state change must reach exactly zero
+    // while Methodus's per-sweep residual threshold is about 1e-300, so the contractive
+    // iteration reaches the rounding floor and can then only stall (a failed line search on
+    // rounding noise) or exhaust its bound -- never be judged diverging.
+    let config = PartitionedConfig {
+        schedule: PartitionedSchedule::Serial,
+        iteration: PartitionedIteration::Implicit {
+            tolerance: 0.0,
+            max_sweeps: 80,
+            relaxation: 1.0,
+        },
+        newton: NewtonConfig {
+            absolute_tolerance: 0.0,
+            relative_tolerance: 1.0e-300,
+            ..NewtonConfig::default()
+        },
+        divergence_growth: 1.5,
+    };
+    let error = run_partitioned(&operator, &context, &[0.0; 4], &config).unwrap_err();
+    match &error {
+        SolveError::Numeric(NumericError::Evaluation {
+            code,
+            origin,
+            message,
+        }) => {
+            assert_eq!(origin, PARTITIONED_REFUSAL_ORIGIN);
+            assert_eq!(code, PARTITIONED_MAX_SWEEPS, "{message}");
+            // The stall path, not bound exhaustion: a failed line search on rounding noise
+            // after a sweep at the floor.
+            assert!(
+                message.contains("stalled at the rounding floor"),
+                "{message}"
+            );
+        }
+        other => panic!("expected a typed refusal, got {other:?}"),
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Package 1: checkpoints are bound to the operator identity and the state to the layout
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn a_partitioned_checkpoint_restores_only_into_the_same_operator() {
+    let context = EvaluationContext::reproducible();
+    let operator = two_block_diffusion(0.3);
+    let mut execution = PartitionedExecution::new(&operator, zero_state(&operator)).unwrap();
+    let config = implicit_config(PartitionedSchedule::Serial, 1.0e-10, 50);
+    execution.solve(&context, &config, 1.0).unwrap();
+    let checkpoint = execution.checkpoint().unwrap();
+    assert_eq!(checkpoint.operator_identity, execution.operator_identity());
+    assert_eq!(checkpoint.operator_identity, operator.identity());
+
+    // The same operator: restores atomically.
+    let mut sibling = PartitionedExecution::new(&operator, zero_state(&operator)).unwrap();
+    sibling.restore(&checkpoint).unwrap();
+    assert_eq!(
+        sibling.state().committed_vector().unwrap(),
+        execution.state().committed_vector().unwrap()
+    );
+
+    // The same leaves and layout with different edge content is a different system: refused,
+    // and the target execution's state is untouched.
+    let other = two_block_diffusion(0.5);
+    assert_eq!(other.layout().identity(), operator.layout().identity());
+    assert_ne!(other.identity(), operator.identity());
+    let mut foreign = PartitionedExecution::new(&other, zero_state(&other)).unwrap();
+    let before = foreign.state().committed_vector().unwrap();
+    let error = foreign.restore(&checkpoint).unwrap_err();
+    assert!(
+        matches!(&error, KrasisError::InvalidCoupling(message) if message.contains("identity")),
+        "{error:?}"
+    );
+    assert_eq!(foreign.state().committed_vector().unwrap(), before);
+}
+
+#[test]
+fn a_partitioned_execution_refuses_a_state_over_a_different_layout() {
+    let operator = two_block_diffusion(0.3);
+    let width = NonlinearOperator::dimension(&operator);
+    // Same width and block names, different block boundaries: not the operator's layout.
+    let layout = StateLayout::new(vec![
+        StateBlock::new(BlockId::new("hot"), 0..width / 2 - 1),
+        StateBlock::new(BlockId::new("cold"), width / 2 - 1..width),
+    ])
+    .unwrap();
+    let mut state = SimulationState::new(layout.clone(), 1);
+    for block in layout.blocks() {
         state
             .insert_field(
                 FieldId::new(block.id().as_str()),
@@ -550,75 +831,246 @@ fn iteration_once_with_a_wrong_coupling_role_is_refused_as_predicted() {
             )
             .unwrap();
     }
+    let error = PartitionedExecution::new(&operator, state).unwrap_err();
+    assert!(
+        matches!(&error, KrasisError::InvalidCoupling(message) if message.contains("layout")),
+        "{error:?}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// Package 2: `iteration = once` is accepted by declaration, and a non-contractive (wrong-role)
+// schedule is refused `PARTITIONED_DIVERGED` as predicted
+// -------------------------------------------------------------------------------------------
+
+/// The dense coupled Jacobian, assembled column by column from the operator's own
+/// Jacobian-vector products at the zero state (both diffusion fixtures are linear).
+fn dense_jacobian(operator: &CoupledSystemOperator) -> Vec<Vec<f64>> {
+    let context = EvaluationContext::reproducible();
+    let dimension = NonlinearOperator::dimension(operator);
+    let zero = vec![0.0; dimension];
+    let mut jacobian = vec![vec![0.0; dimension]; dimension];
+    let mut direction = vec![0.0; dimension];
+    let mut column = vec![0.0; dimension];
+    for column_index in 0..dimension {
+        direction[column_index] = 1.0;
+        NonlinearOperator::jacobian_vector_product(
+            operator,
+            &context,
+            &zero,
+            &direction,
+            &mut column,
+        )
+        .unwrap();
+        for (row, value) in column.iter().enumerate() {
+            jacobian[row][column_index] = *value;
+        }
+        direction[column_index] = 0.0;
+    }
+    jacobian
+}
+
+fn submatrix(
+    matrix: &[Vec<f64>],
+    rows: std::ops::Range<usize>,
+    columns: std::ops::Range<usize>,
+) -> Vec<Vec<f64>> {
+    rows.map(|row| matrix[row][columns.clone()].to_vec())
+        .collect()
+}
+
+/// Gaussian elimination with partial pivoting: test scaffolding for the dense block solves of
+/// `serial_schedule_spectral_radius`, deliberately independent of Methodus.
+fn solve_dense(matrix: &[Vec<f64>], right_hand_side: &[f64]) -> Vec<f64> {
+    let dimension = right_hand_side.len();
+    let mut a = matrix.to_vec();
+    let mut b = right_hand_side.to_vec();
+    for pivot_column in 0..dimension {
+        let pivot_row = (pivot_column..dimension)
+            .max_by(|&left, &right| {
+                a[left][pivot_column]
+                    .abs()
+                    .total_cmp(&a[right][pivot_column].abs())
+            })
+            .unwrap();
+        a.swap(pivot_column, pivot_row);
+        b.swap(pivot_column, pivot_row);
+        assert!(
+            a[pivot_column][pivot_column].abs() > 1.0e-14,
+            "singular block"
+        );
+        for row in (pivot_column + 1)..dimension {
+            let factor = a[row][pivot_column] / a[pivot_column][pivot_column];
+            if factor != 0.0 {
+                let pivot_values = a[pivot_column].clone();
+                for (value, pivot_value) in a[row].iter_mut().zip(&pivot_values).skip(pivot_column)
+                {
+                    *value -= factor * pivot_value;
+                }
+                b[row] -= factor * b[pivot_column];
+            }
+        }
+    }
+    let mut solution = vec![0.0; dimension];
+    for row in (0..dimension).rev() {
+        let mut sum = b[row];
+        for column in (row + 1)..dimension {
+            sum -= a[row][column] * solution[column];
+        }
+        solution[row] = sum / a[row][row];
+    }
+    solution
+}
+
+fn matvec(matrix: &[Vec<f64>], vector: &[f64]) -> Vec<f64> {
+    matrix
+        .iter()
+        .map(|row| row.iter().zip(vector).map(|(a, b)| a * b).sum())
+        .collect()
+}
+
+fn l2(vector: &[f64]) -> f64 {
+    vector.iter().map(|value| value * value).sum::<f64>().sqrt()
+}
+
+/// Spectral radius of the serial schedule's error-propagation map on the second leaf,
+/// `G = A_1^{-1} B_10 A_0^{-1} B_01` (block Gauss-Seidel over the dense coupled Jacobian), by
+/// power iteration. Independent of `krasis::partitioned`: the serial splitting is contractive
+/// exactly when this is below one.
+fn serial_schedule_spectral_radius(operator: &CoupledSystemOperator) -> f64 {
+    let jacobian = dense_jacobian(operator);
+    let first = operator.leaf_range(0).unwrap();
+    let second = operator.leaf_range(1).unwrap();
+    let a0 = submatrix(&jacobian, first.clone(), first.clone());
+    let b01 = submatrix(&jacobian, first.clone(), second.clone());
+    let a1 = submatrix(&jacobian, second.clone(), second.clone());
+    let b10 = submatrix(&jacobian, second.clone(), first.clone());
+    let mut vector: Vec<f64> = (0..second.len()).map(|index| 1.0 + index as f64).collect();
+    let norm = l2(&vector);
+    vector.iter_mut().for_each(|value| *value /= norm);
+    let mut radius = 0.0;
+    for _ in 0..400 {
+        let first_error: Vec<f64> = solve_dense(&a0, &matvec(&b01, &vector))
+            .into_iter()
+            .map(|value| -value)
+            .collect();
+        let image: Vec<f64> = solve_dense(&a1, &matvec(&b10, &first_error))
+            .into_iter()
+            .map(|value| -value)
+            .collect();
+        radius = l2(&image);
+        vector = image.into_iter().map(|value| value / radius).collect();
+    }
+    radius
+}
+
+#[test]
+fn iteration_once_applies_one_accepted_sweep_that_is_not_a_projection_of_the_monolithic_solve() {
+    let operator = two_block_diffusion(0.3);
+    let context = EvaluationContext::reproducible();
+    let dimension = NonlinearOperator::dimension(&operator);
+    let newton = implicit_config(PartitionedSchedule::Serial, 1.0e-10, 50).newton;
+    let monolithic = solve_newton(&operator, &context, &vec![0.0; dimension], &newton).unwrap();
+    assert!(monolithic.converged);
+
     let once_config = PartitionedConfig {
         schedule: PartitionedSchedule::Serial,
         iteration: PartitionedIteration::Once,
-        newton: NewtonConfig {
-            max_iterations: 100,
-            absolute_tolerance: 1.0e-13,
-            relative_tolerance: 1.0e-12,
-            ..NewtonConfig::default()
-        },
+        newton,
         divergence_growth: 10.0,
     };
-    let mut execution = PartitionedExecution::new(&operator, state.clone()).unwrap();
+    let mut execution = PartitionedExecution::new(&operator, zero_state(&operator)).unwrap();
     let report = execution.solve(&context, &once_config, 0.0).unwrap();
     assert_eq!(report.disposition, PartitionedDisposition::OnceApplied);
     assert_eq!(report.sweeps.len(), 1);
+    // Accepted by declaration: the single exchange carries its splitting error and is not the
+    // monolithic solution (the implicit gate above agrees within 1e-8; this does not).
+    let disagreement = max_abs_difference(
+        &execution.state().committed_vector().unwrap(),
+        &monolithic.state,
+    );
+    assert!(
+        disagreement > 1.0e-8,
+        "a once sweep must not reproduce the monolithic solve: disagreement {disagreement:e}"
+    );
+}
 
-    // The wrong (positive-feedback) coupling role, run as `iteration = implicit`: a single
-    // `Once` sweep is always accepted (see `PartitionedIteration::Once`'s docs -- Methodus's own
-    // `solve_blocks` backtracking already forbids a single sweep from raising the residual), so
-    // this unconditionally unstable role/strength choice is predicted to never reach the declared
-    // tolerance -- observed as either a growing interface change (`PARTITIONED_DIVERGED`) or an
-    // exhausted sweep bound (`PARTITIONED_MAX_SWEEPS`), never a silently committed run-away
-    // iterate. This is the architecture's "wrong Dirichlet-Neumann roles" case.
-    let wrong = two_block_diffusion_wrong_role(6.0);
-    let mut wrong_state = SimulationState::new(wrong.layout().clone(), 1);
-    for block in wrong.layout().blocks() {
-        wrong_state
-            .insert_field(
-                FieldId::new(block.id().as_str()),
-                vec![0.0; block.range().len()],
-            )
-            .unwrap();
-    }
-    let before = wrong_state.clone();
-    let wrong_config = PartitionedConfig {
-        schedule: PartitionedSchedule::Serial,
-        iteration: PartitionedIteration::Implicit {
+#[test]
+fn a_non_contractive_wrong_role_schedule_is_refused_diverged_under_once_and_implicit() {
+    let context = EvaluationContext::reproducible();
+    // Generous: the refusals below cannot be budget artifacts.
+    let budget = 50;
+
+    // The regime, established independently of the driver: the serial splitting's spectral
+    // radius scales as (strength / s*)^2 with s* about 29.4 on this mesh. Strength 6 (which the
+    // first version of this test used) is a convergent configuration; strength 60 is not.
+    let contractive = serial_schedule_spectral_radius(&two_block_diffusion_wrong_role(6.0));
+    assert!(
+        contractive < 0.05,
+        "strength 6 is a convergent configuration: spectral radius {contractive:e}"
+    );
+    let wrong = two_block_diffusion_wrong_role(60.0);
+    let radius = serial_schedule_spectral_radius(&wrong);
+    assert!(
+        radius > 1.0,
+        "strength 60 must be non-contractive: spectral radius {radius:e}"
+    );
+
+    let newton = implicit_config(PartitionedSchedule::Serial, 1.0e-10, budget).newton;
+    for iteration in [
+        PartitionedIteration::Once,
+        PartitionedIteration::Implicit {
             tolerance: 1.0e-10,
-            max_sweeps: 8,
+            max_sweeps: budget,
             relaxation: 1.0,
         },
-        newton: once_config.newton.clone(),
-        divergence_growth: 2.0,
-    };
-    let mut wrong_execution = PartitionedExecution::new(&wrong, wrong_state).unwrap();
-    let error = wrong_execution
-        .solve(&context, &wrong_config, 0.0)
-        .unwrap_err();
-    match &error {
-        KrasisError::EvaluationRefused { code, .. } => {
-            assert!(
-                code == PARTITIONED_DIVERGED || code == PARTITIONED_MAX_SWEEPS,
-                "{error:?}"
-            );
+    ] {
+        let config = PartitionedConfig {
+            schedule: PartitionedSchedule::Serial,
+            iteration: iteration.clone(),
+            newton: newton.clone(),
+            divergence_growth: 2.0,
+        };
+        let state = zero_state(&wrong);
+        let before = state.committed_vector().unwrap();
+        let mut execution = PartitionedExecution::new(&wrong, state).unwrap();
+        let error = execution.solve(&context, &config, 0.0).unwrap_err();
+        match &error {
+            KrasisError::EvaluationRefused {
+                code,
+                origin,
+                message,
+            } => {
+                assert_eq!(code, PARTITIONED_DIVERGED, "{iteration:?}: {message}");
+                assert_eq!(origin, PARTITIONED_REFUSAL_ORIGIN);
+                // The mechanism: the whole schedule correction cannot reduce the residual at
+                // any admissible damping (Methodus's per-sweep line search), mapped by Krasis.
+                assert!(
+                    message.contains("no admissible damping"),
+                    "{iteration:?}: {message}"
+                );
+            }
+            other => panic!("{iteration:?}: expected PARTITIONED_DIVERGED, got {other:?}"),
         }
-        KrasisError::Solve(message) => {
-            // A sweep whose line search cannot find a damping that improves the residual, or
-            // that overflows to a non-finite value, is refused by Methodus's own guard first;
-            // still a typed refusal, never a silently accepted iterate.
-            assert!(
-                message.to_lowercase().contains("non-finite")
-                    || message.to_lowercase().contains("line search"),
-                "{message}"
-            );
-        }
-        other => panic!("expected a typed refusal, got {other:?}"),
+        assert_eq!(
+            execution.state().committed_vector().unwrap(),
+            before,
+            "{iteration:?} committed something after a refusal"
+        );
     }
-    assert_eq!(
-        wrong_execution.state().committed_vector().unwrap(),
-        before.committed_vector().unwrap()
-    );
+
+    // Positive control: the correctly-signed fixture is contractive and converges under the
+    // same budget, so the refusals above are the schedule's, not the budget's.
+    let right = two_block_diffusion(0.3);
+    assert!(serial_schedule_spectral_radius(&right) < 1.0);
+    let mut execution = PartitionedExecution::new(&right, zero_state(&right)).unwrap();
+    let report = execution
+        .solve(
+            &context,
+            &implicit_config(PartitionedSchedule::Serial, 1.0e-10, budget),
+            0.0,
+        )
+        .unwrap();
+    assert_eq!(report.disposition, PartitionedDisposition::Converged);
+    assert!(report.sweeps.len() < budget);
 }

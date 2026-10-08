@@ -1,5 +1,63 @@
 # Krasis status
 
+2026-10-08 SC-W3 review fixes on `06deede` (pre-publication). `tests/sc_w3_partitioned.rs` is
+now 10 tests; owner gate 80 tests across 12 targets (70 unchanged across 10 targets plus the 10
+here; `--lib` has no unit tests and `--doc` runs 0), formatting, `cargo check`, strict
+all-feature clippy, rustdoc `-D warnings` and doctests clean against Finitum `0f53b92` /
+Methodus `24f9c7d`:
+- **The wrong-role refusal is now real.** Strength 6 of `two_block_diffusion_wrong_role` is a
+  *convergent* configuration (serial-splitting spectral radius 0.042; it converges at sweep 9, so
+  `06deede`'s refusal at `max_sweeps = 8` was a budget artifact). For this fixture the splitting's
+  contraction depends on the exchange magnitude alone (the sign cancels in the error-propagation
+  product `A_1^-1 B_10 A_0^-1 B_01`): spectral radius `(strength / s*)^2` with `s*` about 29.4
+  on the 3x3 mesh, established in the test by power iteration over the dense coupled Jacobian,
+  independently of the driver. The test uses strength 60 (radius 4.2) under a 50-sweep budget,
+  asserts the radius exceeds one, asserts `PARTITIONED_DIVERGED` for both `iteration = once` and
+  `implicit`, asserts the committed state is bit-identical afterwards, and runs the positive
+  control (correct role at 0.3, radius 1e-4, `Converged` under the same budget).
+- **The real refusal mechanism.** A non-contractive splitting has an error-propagation mode with
+  factor above one that grows under every damping of a sweep's correction, so Methodus's
+  per-sweep backtracking (`solve_blocks`, `max_iterations = 1`) refuses `LineSearchFailed` before
+  any unbounded iterate forms (sweep 1 for strength 60 and above, sweep 2 for 30-40, on this
+  fixture). `run_partitioned` maps that refusal to the typed `PARTITIONED_DIVERGED` (origin
+  `PARTITIONED_REFUSAL_ORIGIN`; message carries the sweep index, the residual norm at the sweep's
+  input and the previous sweep's state change) instead of letting it reach callers as the uncoded
+  `KrasisError::Solve("line search ...")`. The sweep-over-sweep growth test (`divergence_growth`)
+  remains the second observation. A literal `once` sweep cannot be judged diverging by the growth
+  test (it has no predecessor); it *is* refused through the line-search mechanism, which the
+  strength-60 fixture demonstrates; a `once` sweep the line search accepts, damped or not, is
+  accepted by declaration and carries the splitting error.
+- **`NewtonConfig.acceleration` is refused by this transaction** (`SolveError::InvalidConfiguration`,
+  `KrasisError::Solve` through `PartitionedExecution`, nothing committed): forwarded per sweep it
+  would skip Methodus's backtracking (voiding the observation above) and Aitken's history would
+  reset every sweep, degrading to a fixed factor stacked on Krasis's `relaxation`. Krasis's
+  `relaxation` is the one acceleration axis today. The consumable Methodus shape for the sweep
+  loop is `methodus::accelerate_fixed_point` over a `FixedPointOperator` wrapping one sweep; the
+  next package consumes it and drops Krasis's own `relaxation`, so one acceleration axis remains
+  (`sinbad/ARCHITECTURE.md` §8).
+- **Negative controls for the agreement gates.** A `once` steady run is accepted (`OnceApplied`)
+  and disagrees with monolithic Newton by more than 1e-8; a `once` solver inside BDF is accepted
+  at every step (the declared regime, not a projection; a run using it must say so at the run
+  level) and disagrees with dense Newton by more than 1e-9 at some accepted step, so the implicit
+  gates cannot pass by silently running monolithic Newton.
+- **Checkpoints are bound to the operator.** `PartitionedExecution` requires
+  `BlockNonlinearOperator + TransactionalOperator`, binds `TransactionalOperator::identity` into
+  `PartitionedCheckpoint { operator_identity, state }` (like `BlockLinearCheckpoint` /
+  `CoupledCheckpoint`), refuses restoring into a different operator over the same layout
+  (`InvalidCoupling`, state untouched), and `new` refuses a state whose layout identity is not the
+  operator's and a solver block layout that does not tile the state blocks.
+- **Rounding floor.** Both divergence observations ignore a previous sweep whose change was at
+  most 32 ulps of `max(1, ‖state‖∞)` (was an absolute 1e-12); a failed line search from there is
+  a stall, refused `PARTITIONED_MAX_SWEEPS` with a message saying so, never
+  `PARTITIONED_DIVERGED` (`a_stall_at_the_rounding_floor_is_refused_max_sweeps_never_diverged`,
+  on a four-unknown linear system with sub-rounding declared tolerances).
+- **Shapes.** `SweepReport::interface_norm` is renamed `state_change_norm` (the sup-norm change
+  of the whole schedule-updated state, not an interface trace/flux measure); the refusal origin
+  `krasis partitioned fixed point` is published as `PARTITIONED_REFUSAL_ORIGIN`;
+  `PartitionedCheckpoint` is new. No existing identity, layout or refusal code consumed by
+  Sinbad changed. Not done here (recorded as the next package): sweep-level consumption of
+  `accelerate_fixed_point`.
+
 2026-09-29 SC-W3 package 1/2 landed (partitioned fixed-point transaction):
 `krasis::partitioned` adds a partitioned decomposition over any `methodus::BlockLayout` (serial
 Gauss-Seidel / parallel Jacobi schedule), usable as a standalone steady transaction
@@ -10,8 +68,9 @@ Gauss-Seidel / parallel Jacobi schedule), usable as a standalone steady transact
 (forwarding to its inner `CoupledSystemOperator`'s leaf-range layout, valid because elimination
 preserves dimension and index), so both `ConnectedSystemOperator` and `CoupledSystemOperator`
 admit the same `partitioned` decomposition per the brief. Existing 70 owner tests are unchanged;
-4 new tests in `tests/sc_w3_partitioned.rs` bring the gate to 74 tests across 12 targets, all
-passing with formatting, `cargo check`, strict all-feature clippy, rustdoc and doctests clean.
+4 new tests in `tests/sc_w3_partitioned.rs` brought the gate to 74 tests across 12 targets (80
+after the 2026-10-08 fixes above), all passing with formatting, `cargo check`, strict
+all-feature clippy, rustdoc and doctests clean.
 
 Ownership split: Methodus's existing `solve_blocks(.., max_iterations = 1, ..)` is called once
 per sweep (the per-block Newton-with-backtracking algorithm Methodus already owns); Krasis owns
@@ -26,26 +85,25 @@ implicit iteration exhausts its bound without reaching its declared tolerance). 
 agreement gate (`tests/sc_w3_partitioned.rs`): a steady two-leaf conduction fixture's serial and
 parallel partitioned solves agree with monolithic Newton within 1e-8; a transient DAE/BDF fixture
 plugged in as the BDF solver agrees with the dense-Newton trajectory within 1e-9 per accepted
-step; a wrong-role (positive-feedback) coupling run under `iteration = implicit` is refused
-typed (`PARTITIONED_DIVERGED` or `PARTITIONED_MAX_SWEEPS`, both observed depending on the
-fixture) rather than committed, and a refused solve leaves the committed state bit-identical to
-before the attempt.
+step; a non-contractive wrong-role coupling run is refused `PARTITIONED_DIVERGED` under both
+`iteration = once` and `implicit` (the mechanism is in the 2026-10-08 entry; the 2026-09-29
+version of this test used a convergent strength and was vacuous) rather than committed, and a
+refused solve leaves the committed state bit-identical to before the attempt.
 
 Recorded findings and open items:
-- **A literal `iteration = once` sweep cannot be judged diverging by construction.** Methodus's
-  `solve_blocks` already backtracks each sweep to guarantee its own residual does not grow (it
-  refuses `SolveError::LineSearchFailed` first), and Krasis's divergence test compares a sweep's
-  interface change against the *previous* sweep's, which a lone `Once` sweep has none of. The
-  architecture's "wrong Dirichlet-Neumann roles" instability therefore only surfaces across
-  repeated application: an `Implicit` iteration (demonstrated above) or, for a plugged-in `Once`
-  solver, across repeated BDF steps until a later step's evaluation hits a typed non-finite
-  refusal. This is intrinsic to driving the iteration through Methodus's existing per-sweep
-  algorithm as the brief directs, not a gap in this package.
-- **No iterate acceleration.** Methodus does not yet expose Aitken/IQN acceleration (SV7-F3);
-  `PartitionedIteration::Implicit` offers only plain iteration and the fixed relaxation factor
-  Krasis itself applies (a vector combination). Cross-repo need: once Methodus lands an
-  acceleration primitive over `&[f64]` iterate sequences, `PartitionedConfig` should gain an
-  `acceleration` axis consuming it instead of (or in addition to) fixed relaxation.
+- **A literal `iteration = once` sweep cannot be judged diverging by the growth test.** Krasis's
+  sweep-over-sweep growth test compares a sweep's state change against the *previous* sweep's,
+  which a lone `Once` sweep has none of. Since 2026-10-08 a `Once` sweep is nevertheless refused
+  `PARTITIONED_DIVERGED` when its whole schedule correction cannot reduce the residual at any
+  admissible damping (Methodus's per-sweep backtracking refuses `LineSearchFailed`, which Krasis
+  maps); a `Once` sweep the line search accepts is accepted by declaration, carries the splitting
+  error, and inside BDF is the declared `once` regime (accepted steps are not projections).
+- **Iterate acceleration: refused here, consumable next.** Methodus `24f9c7d` exposes
+  `accelerate_fixed_point` / `FixedPointOperator` (SV7-F3 subset) and `NewtonConfig.acceleration`;
+  this transaction refuses the latter (see the 2026-10-08 entry) and offers plain iteration plus
+  Krasis's fixed `relaxation` only. Next package: a `FixedPointOperator` wrapping one sweep,
+  driven by `accelerate_fixed_point`, replacing Krasis's own `relaxation` so one acceleration
+  axis remains.
 - **`ConnectedSystemOperator` partitioning is wired but not proven against a real matching
   fixture.** The `BlockNonlinearOperator` impl is real and type-checked (leaf ranges are
   preserved under elimination: `new`/`new_system` already require
@@ -84,8 +142,9 @@ is pending. Finitum dependency: `2de7dd8cfcf173f364114728c590402ccc4d820c`.
 Evidence: `docs/validation/2026-09-17-sc-w2/`.
 
 
-Updated: 2026-09-29
-Milestone: SC-W3 package 1/2, the partitioned fixed-point transaction.
+Updated: 2026-10-08
+Milestone: SC-W3 package 1/2, the partitioned fixed-point transaction, with the pre-publication
+review fixes.
 
 ## Ownership
 
