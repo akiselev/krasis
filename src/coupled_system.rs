@@ -879,6 +879,45 @@ impl DaeOperator for CoupledSystemOperator {
         self.layout.width()
     }
 
+    /// Every edge acts between two distinct leaves, so each entry an edge contributes lies in
+    /// an off-diagonal leaf block: the Jacobian diagonal is the concatenation of the leaves'
+    /// own diagonals, available exactly when every leaf supplies one (W10 package 4, the
+    /// per-block Jacobi solves of the block Gauss-Seidel factory).
+    fn jacobian_diagonal(
+        &self,
+        context: &EvaluationContext,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        rate_shift: f64,
+    ) -> Result<Option<Vec<f64>>, NumericError> {
+        self.require_len("coupled system state", state.len())?;
+        self.require_len("coupled system state rate", state_rate.len())?;
+        let mut diagonal = Vec::with_capacity(self.layout.width());
+        for (index, leaf) in self.leaves.iter().enumerate() {
+            let range = self.leaf_range(index).expect("leaf index");
+            let Some(local) = leaf.operator.jacobian_diagonal(
+                context,
+                time,
+                &state[range.clone()],
+                &state_rate[range.clone()],
+                rate_shift,
+            )?
+            else {
+                return Ok(None);
+            };
+            if local.len() != range.len() {
+                return Err(NumericError::DimensionMismatch {
+                    operation: format!("leaf `{}` Jacobian diagonal", leaf.name),
+                    expected: range.len(),
+                    actual: local.len(),
+                });
+            }
+            diagonal.extend(local);
+        }
+        Ok(Some(diagonal))
+    }
+
     fn residual(
         &self,
         context: &EvaluationContext,
@@ -998,6 +1037,15 @@ impl DaeOperator for CoupledSystemOperator {
 impl NonlinearOperator for CoupledSystemOperator {
     fn dimension(&self) -> usize {
         self.layout.width()
+    }
+
+    fn jacobian_diagonal(
+        &self,
+        context: &EvaluationContext,
+        state: &[f64],
+    ) -> Result<Option<Vec<f64>>, NumericError> {
+        let zero = vec![0.0; self.layout.width()];
+        DaeOperator::jacobian_diagonal(self, context, 0.0, state, &zero, 0.0)
     }
 
     /// The steady view at `t = 0`, `ydot = 0` (the convention [`CoupledOperator`] uses).

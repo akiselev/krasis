@@ -4,6 +4,7 @@ mod connected;
 pub use connected::ConnectedSystemOperator;
 mod binding;
 mod block_binding;
+mod block_preconditioner;
 mod block_solve;
 mod checkpoint;
 mod coupled;
@@ -18,6 +19,7 @@ mod verification;
 
 pub use binding::{SemanticId, StateBinding};
 pub use block_binding::block_state_layout;
+pub use block_preconditioner::{BlockCoupling, BlockGaussSeidelFactory};
 pub use block_solve::{
     BlockLinearAlgorithm, BlockLinearCheckpoint, BlockLinearExecution, BlockLinearReport,
     BlockLinearSolver, OperatorIdentity,
@@ -36,10 +38,10 @@ pub use event::{EventDirection, EventRecord};
 pub use initial::{NodalContext, initial_state_from};
 pub use layout::{BlockId, StateBlock, StateLayout};
 pub use partitioned::{
-    PARTITIONED_DIVERGED, PARTITIONED_MAX_SWEEPS, PARTITIONED_REFUSAL_ORIGIN,
-    PartitionedCheckpoint, PartitionedConfig, PartitionedDisposition, PartitionedExecution,
-    PartitionedFixedPoint, PartitionedIteration, PartitionedReport, PartitionedSchedule,
-    PartitionedSolve, SweepReport, run_partitioned,
+    PARTITIONED_ACCELERATION_BREAKDOWN, PARTITIONED_DIVERGED, PARTITIONED_MAX_SWEEPS,
+    PARTITIONED_REFUSAL_ORIGIN, PartitionedAcceleration, PartitionedCheckpoint, PartitionedConfig,
+    PartitionedDisposition, PartitionedExecution, PartitionedFixedPoint, PartitionedIteration,
+    PartitionedReport, PartitionedSchedule, PartitionedSolve, SweepReport, run_partitioned,
 };
 pub use state::{ConstitutiveSlot, FieldId, SimulationState, TransactionPhase};
 pub use verification::{

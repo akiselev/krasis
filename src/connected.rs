@@ -9,10 +9,22 @@ use methodus::{
     NumericError,
 };
 
+/// The single-relation, two-operator shape Finitum's
+/// [`ConnectionRealizationPlan::system_linearized_diagonal`] covers (`matching` or
+/// `nested_p1`): the plan and the inner leaf index of each connection endpoint, retained at
+/// construction so the connected Jacobian diagonal is Finitum's exact `diag(Rᵀ J R)` (W10
+/// package 1) rather than a Krasis-side sum of leaf diagonals.
+#[derive(Clone, Debug)]
+struct ConnectedPair {
+    plan: ConnectionRealizationPlan,
+    leaves: [usize; 2],
+}
+
 #[derive(Clone, Debug)]
 pub struct ConnectedSystemOperator {
     inner: CoupledSystemOperator,
     constraints: ConstraintSet,
+    pair: Option<ConnectedPair>,
     identity: String,
     consistent_initialization: Option<crate::coupled::ConsistentInitialization>,
 }
@@ -61,12 +73,22 @@ impl ConnectedSystemOperator {
         Ok(Self {
             inner,
             constraints,
+            pair: Some(ConnectedPair {
+                plan: connection.clone(),
+                leaves: [0, 1],
+            }),
             identity,
             consistent_initialization: None,
         })
     }
 
     /// Compose matching interfaces over leaves in scientific instance order.
+    ///
+    /// A system of exactly one relation over exactly two operators whose composed constraints
+    /// are the relation's own (same targets, dependencies and orientation) is the shape
+    /// Finitum's connected diagonal covers and takes that path; any other shape (several
+    /// relations, more leaves, or a relation the union-find re-oriented) keeps the Krasis-side
+    /// sum-of-leaf-diagonals convention Finitum does not cover yet.
     pub fn new_system(
         inner: CoupledSystemOperator,
         connections: &[ConnectionRealizationPlan],
@@ -90,6 +112,55 @@ impl ConnectedSystemOperator {
                 "connection operators differ from coupled leaves".into(),
             ));
         }
+        let pair = match (connections, operators) {
+            ([plan], [first, second]) => {
+                let leaves = plan
+                    .relation()
+                    .ports
+                    .each_ref()
+                    .map(|port| port.instance.index());
+                let endpoints = match leaves {
+                    [0, 1] => Some([*first, *second]),
+                    [1, 0] => Some([*second, *first]),
+                    _ => None,
+                };
+                endpoints.and_then(|endpoints| {
+                    let own = plan.constraints(endpoints).ok()?;
+                    let split = endpoints[0].operator().dimension();
+                    let offset = inner.leaf_range(leaves[0]).expect("leaf index").start;
+                    let other = inner.leaf_range(leaves[1]).expect("leaf index").start;
+                    let global = |local: usize| {
+                        if local < split {
+                            offset + local
+                        } else {
+                            other + local - split
+                        }
+                    };
+                    let same_orientation = own.dof_count() == constraints.dof_count()
+                        && own.constraints().count() == constraints.constraints().count()
+                        && own.constraints().all(|constraint| {
+                            constraints.constraints().any(|composed| {
+                                composed.target.0 == global(constraint.target.0)
+                                    && composed.offset == constraint.offset
+                                    && composed.dependencies.len() == constraint.dependencies.len()
+                                    && composed
+                                        .dependencies
+                                        .iter()
+                                        .zip(&constraint.dependencies)
+                                        .all(|(composed, own)| {
+                                            composed.dof.0 == global(own.dof.0)
+                                                && composed.weight == own.weight
+                                        })
+                            })
+                        });
+                    same_orientation.then(|| ConnectedPair {
+                        plan: plan.clone(),
+                        leaves,
+                    })
+                })
+            }
+            _ => None,
+        };
         let mut identities = connections.iter().map(|c| c.identity()).collect::<Vec<_>>();
         identities.sort_unstable();
         let identity = format!(
@@ -100,6 +171,7 @@ impl ConnectedSystemOperator {
         Ok(Self {
             inner,
             constraints,
+            pair,
             identity,
             consistent_initialization: None,
         })
@@ -152,23 +224,68 @@ impl ConnectedSystemOperator {
     pub fn physical_state(&self, state: &[f64]) -> Result<Vec<f64>, NumericError> {
         self.constraints.expand(state).map_err(numerical)
     }
-}
-impl DaeOperator for ConnectedSystemOperator {
-    fn make_initial_state_consistent(
-        &self,
-        context: &EvaluationContext,
-        time: f64,
-        state: &mut [f64],
-    ) -> Result<(), NumericError> {
-        crate::coupled::make_initial_state_consistent_for(
-            self,
-            self.consistent_initialization.as_ref(),
-            context,
-            time,
-            state,
-        )
+
+    /// Whether the Jacobian diagonal is Finitum's connected `diag(Rᵀ J R)` (the
+    /// single-relation, two-operator shape) rather than the Krasis-side sum-of-leaf
+    /// convention over a multi-relation union.
+    pub fn has_connected_diagonal(&self) -> bool {
+        self.pair.is_some()
     }
-    fn jacobian_diagonal(
+
+    /// Finitum's exact connected diagonal for the retained pair: the per-leaf slices of the
+    /// connection-reduced point (leaf ranges are preserved under elimination) go to
+    /// [`ConnectionRealizationPlan::system_linearized_diagonal`] in endpoint order, and its
+    /// `[a; b]` result is scattered back into the leaves' ranges. Target and essential rows
+    /// are the identity rows Finitum already sets.
+    fn pair_diagonal(
+        &self,
+        pair: &ConnectedPair,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        rate_shift: f64,
+    ) -> Result<Option<Vec<f64>>, NumericError> {
+        let realizations = self.inner.realizations();
+        let ranges = pair
+            .leaves
+            .map(|leaf| self.inner.leaf_range(leaf).expect("pair leaf index"));
+        let [
+            FinitumRealization::ReducedSystem(a),
+            FinitumRealization::ReducedSystem(b),
+        ] = [realizations[pair.leaves[0]], realizations[pair.leaves[1]]]
+        else {
+            return Ok(None);
+        };
+        let Some(connected) = pair
+            .plan
+            .system_linearized_diagonal(
+                [a, b],
+                time,
+                [&state[ranges[0].clone()], &state[ranges[1].clone()]],
+                [
+                    &state_rate[ranges[0].clone()],
+                    &state_rate[ranges[1].clone()],
+                ],
+                rate_shift,
+            )
+            .map_err(numerical)?
+        else {
+            return Ok(None);
+        };
+        let split = ranges[0].len();
+        let mut diagonal = vec![0.0; DaeOperator::dimension(self)];
+        diagonal[ranges[0].clone()].copy_from_slice(&connected[..split]);
+        diagonal[ranges[1].clone()].copy_from_slice(&connected[split..]);
+        Ok(Some(diagonal))
+    }
+
+    /// The multi-relation union shape Finitum's connected diagonal does not cover: weight-1
+    /// equivalence classes identify coordinates across leaves and each physical node occurs at
+    /// most once per leaf, so there are no within-leaf cross entries in a class and
+    /// `diag(Pᵀ J P)` is the transpose restriction of the concatenated leaf diagonals, with
+    /// target rows the identity. Anything else (a weighted dependency, a class with two nodes
+    /// of one leaf) returns `None`.
+    fn union_diagonal(
         &self,
         context: &EvaluationContext,
         time: f64,
@@ -176,11 +293,6 @@ impl DaeOperator for ConnectedSystemOperator {
         state_rate: &[f64],
         rate_shift: f64,
     ) -> Result<Option<Vec<f64>>, NumericError> {
-        if !self.inner.graph().dependencies().is_empty() {
-            return Ok(None);
-        }
-        // Weighted interpolation needs within-leaf cross entries in diag(P^T J P).
-        // A sum of leaf diagonals is not exact for a nonmatching trace.
         if self
             .constraints
             .constraints()
@@ -234,9 +346,6 @@ impl DaeOperator for ConnectedSystemOperator {
             diagonal.extend(local);
             offset += n;
         }
-        // Each physical node occurs at most once per leaf; matching identifies
-        // coordinates across leaves. There are no within-leaf cross entries in
-        // an equivalence class. Thus diag(P^T J P) is the sum of these diagonals.
         let mut diagonal = self
             .constraints
             .restrict_transpose(&diagonal)
@@ -245,6 +354,44 @@ impl DaeOperator for ConnectedSystemOperator {
             diagonal[constraint.target.0] = 1.0;
         }
         Ok(Some(diagonal))
+    }
+}
+impl DaeOperator for ConnectedSystemOperator {
+    fn make_initial_state_consistent(
+        &self,
+        context: &EvaluationContext,
+        time: f64,
+        state: &mut [f64],
+    ) -> Result<(), NumericError> {
+        crate::coupled::make_initial_state_consistent_for(
+            self,
+            self.consistent_initialization.as_ref(),
+            context,
+            time,
+            state,
+        )
+    }
+    /// `diag(Rᵀ J R)` of the connection-reduced system. The single-relation, two-operator shape
+    /// is Finitum's exact connected diagonal (weighted `nested_p1` interpolation included: the
+    /// within-leaf cross term `Σ w_β J_B[β,γ] w_γ` an interface-adjacent master row gains); the
+    /// multi-relation union shape is the Krasis-side sum-of-leaf-diagonals convention. Either
+    /// is `None` when the inner composition carries coupling edges (their entries fall into the
+    /// eliminated classes) or a leaf supplies no diagonal.
+    fn jacobian_diagonal(
+        &self,
+        context: &EvaluationContext,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        rate_shift: f64,
+    ) -> Result<Option<Vec<f64>>, NumericError> {
+        if !self.inner.graph().dependencies().is_empty() {
+            return Ok(None);
+        }
+        match &self.pair {
+            Some(pair) => self.pair_diagonal(pair, time, state, state_rate, rate_shift),
+            None => self.union_diagonal(context, time, state, state_rate, rate_shift),
+        }
     }
 
     fn dimension(&self) -> usize {

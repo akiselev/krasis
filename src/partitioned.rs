@@ -4,26 +4,31 @@
 //! [`crate::CoupledExecution::attempt_step_with`] so it runs inside the same BDF transaction as
 //! every other solver ([`methodus::BlockNewton`], [`methodus::NewtonKrylovSolver`]).
 //!
-//! Ownership split: Methodus already owns the per-sweep algorithm
-//! ([`methodus::solve_blocks`] with `BlockStrategy::GaussSeidel`/`Jacobi`, one Newton update
-//! per block per call with `max_iterations = 1`); Krasis owns running that call repeatedly as a
-//! fixed-point iteration, evaluating its own **output-based** convergence between sweeps (the
-//! sup-norm change of the schedule-updated state -- the exchanged data a `CouplingEdge` or a
-//! `ConnectedSystemOperator` eliminated-interface row reads -- rather than the residual norm
-//! `solve_blocks` itself checks), applying a fixed relaxation factor to that state (a vector
-//! combination, not a solver algorithm), and refusing typed when the iteration provably
-//! diverges or exhausts its bound.
+//! Ownership split: Methodus owns the per-sweep algorithm ([`methodus::solve_blocks`] with
+//! `BlockStrategy::GaussSeidel`/`Jacobi`, one Newton update per block per call with
+//! `max_iterations = 1`) **and**, since W10, the fixed-point iteration over sweeps:
+//! [`methodus::accelerate_fixed_point`] drives `x_{k+1} = x_k + ω_k (G(x_k) − x_k)` over a
+//! [`FixedPointOperator`] whose one evaluation `G(x)` is one schedule sweep from `x` (the raw
+//! state after `solve_blocks(.., max_iterations = 1, ..)`), under
+//! [`AccelerationMethod::FixedRelaxation`] or [`AccelerationMethod::Aitken`] -- the one
+//! acceleration axis of this transaction. Krasis owns the sweep operator (how a sweep is
+//! evaluated, what it records), the two divergence observations it makes inside that operator,
+//! and the mapping of every outcome onto this module's typed refusals.
 //!
-//! Acceleration: Krasis's `relaxation` is this transaction's only acceleration axis.
-//! `NewtonConfig::acceleration` (Methodus's per-call Aitken/fixed relaxation of the partitioned
-//! Newton correction) is refused by [`PartitionedConfig`] rather than forwarded: forwarded into
-//! every per-sweep `solve_blocks` call it would skip Methodus's backtracking (voiding the
-//! line-search divergence observation below) and, because each sweep is a fresh call with
-//! `max_iterations = 1`, Aitken's history would reset every sweep and degrade to a fixed factor
-//! stacked multiplicatively with `relaxation`. The consumable Methodus shape for the sweep loop
-//! is [`methodus::accelerate_fixed_point`] over a [`methodus::FixedPointOperator`] wrapping one
-//! sweep; consuming it (and dropping `relaxation`, so one acceleration axis remains) is the next
-//! package, recorded in `STATUS.md`.
+//! Convergence is Methodus's test on the fixed-point residual: `‖G(x_k) − x_k‖₂ ≤ tolerance`
+//! (the declared `tolerance` is the absolute term; the relative term is zero). The residual
+//! `G(x) − x` is the change of the whole schedule-updated state -- the exchanged data a
+//! `CouplingEdge` or a `ConnectedSystemOperator` eliminated-interface row reads -- so this is
+//! the same output-based measure the pre-W10 loop evaluated, in the l2 norm instead of the sup
+//! norm (l2 ≥ sup, so a converged iteration also meets the former test). The committed state is
+//! the terminal sweep's raw output `G(x_k)` (one full schedule sweep from the iterate Methodus
+//! judged converged, so every block is Newton-solved against the others' values), which for
+//! `FixedRelaxation { factor: 1.0 }` is exactly the pre-W10 plain iteration's result.
+//!
+//! `NewtonConfig::acceleration` (Methodus's per-call relaxation of the partitioned Newton
+//! correction) stays refused by [`PartitionedConfig`]: forwarded into every per-sweep
+//! `solve_blocks` call it would skip Methodus's backtracking (voiding the line-search divergence
+//! observation below) and double the acceleration axis.
 //!
 //! State layout, block ids and checkpoint identity are untouched: this module adds no new
 //! operator type and changes no existing identity. A [`PartitionedExecution`] wraps the same
@@ -33,13 +38,17 @@
 //! caller's existing transaction does, exactly as it does for any other `NonlinearSolver`.
 //!
 //! Every refusal this module records is a [`NumericError::Evaluation`] whose `origin` is
-//! [`PARTITIONED_REFUSAL_ORIGIN`] and whose `code` is [`PARTITIONED_DIVERGED`] or
-//! [`PARTITIONED_MAX_SWEEPS`]; consumers key on that pair.
+//! [`PARTITIONED_REFUSAL_ORIGIN`] and whose `code` is [`PARTITIONED_DIVERGED`],
+//! [`PARTITIONED_MAX_SWEEPS`] or [`PARTITIONED_ACCELERATION_BREAKDOWN`]; consumers key on that
+//! pair.
+
+use std::sync::Mutex;
 
 use methodus::{
-    BlockLayout, BlockNonlinearOperator, BlockStrategy, EvaluationContext, IterationTrace,
+    AccelerationConfig, AccelerationIteration, AccelerationMethod, BlockLayout,
+    BlockNonlinearOperator, BlockStrategy, EvaluationContext, FixedPointOperator, IterationTrace,
     NewtonConfig, NonlinearOperator, NonlinearSolver, NumericError, SolveError, SolveReport,
-    solve_blocks,
+    accelerate_fixed_point, solve_blocks,
 };
 use serde::{Deserialize, Serialize};
 
@@ -48,7 +57,7 @@ use crate::{
 };
 
 /// The refusal code recorded when the partitioned schedule provably diverges, by either of the
-/// two observations Krasis makes on the fixed-point iteration it drives:
+/// two observations Krasis makes inside the sweep operator it hands Methodus:
 ///
 /// - a sweep whose whole schedule correction cannot reduce the residual at any admissible
 ///   damping: Methodus's per-sweep `solve_blocks` refuses `SolveError::LineSearchFailed`, and
@@ -57,18 +66,26 @@ use crate::{
 ///   factor exceeds one, and that mode grows under every damping of the sweep's correction, so
 ///   the backtracked per-sweep algorithm necessarily fails before an unbounded iterate can form.
 ///   This is the only observation that can judge a first, or a `Once`, sweep diverging.
-/// - a sweep (other than the first) whose change to the schedule-updated state grows beyond
+/// - a sweep (other than the first) whose fixed-point residual `‖G(x) − x‖∞` grows beyond
 ///   [`PartitionedConfig::divergence_growth`] times the previous sweep's.
 ///
-/// Neither observation is made when the previous sweep's change was already at the rounding
+/// Neither observation is made when the previous sweep's residual was already at the rounding
 /// floor (see [`run_partitioned`]): growth or a failed line search from there is a stall, refused
 /// [`PARTITIONED_MAX_SWEEPS`], never divergence. Never reported as bare non-convergence.
 pub const PARTITIONED_DIVERGED: &str = "PARTITIONED_DIVERGED";
 /// The refusal code recorded when an implicit partitioned iteration does not reach its declared
-/// tolerance: it exhausts `max_sweeps`, or it stalls earlier at the rounding floor (the previous
-/// sweep changed the state by at most the noise floor and this sweep's correction cannot reduce
-/// the residual at any admissible damping, so no further sweep could reach the tolerance).
+/// tolerance: Methodus's fixed-point driver exhausts the `max_sweeps` evaluations it is given
+/// (`SolveError::AccelerationNotConverged`, its trace quoted in the message), or the iteration
+/// stalls earlier at the rounding floor (the previous sweep changed the state by at most the
+/// noise floor and this sweep's correction cannot reduce the residual at any admissible damping,
+/// so no further sweep could reach the tolerance).
 pub const PARTITIONED_MAX_SWEEPS: &str = "PARTITIONED_MAX_SWEEPS";
+/// The refusal code recorded when Methodus's accelerator breaks down
+/// (`SolveError::AccelerationBreakdown`: a degenerate Aitken denominator, two consecutive
+/// fixed-point residuals agreeing to rounding, or a non-finite factor). The iterate is never
+/// silently accepted; the message carries the sweep, Methodus's reason and the per-sweep
+/// residual history.
+pub const PARTITIONED_ACCELERATION_BREAKDOWN: &str = "PARTITIONED_ACCELERATION_BREAKDOWN";
 /// The `origin` of every refusal this module records ([`NumericError::Evaluation`], surfacing
 /// as [`crate::KrasisError::EvaluationRefused`]): consumers key on this string together with
 /// the code to attribute a refusal to the partitioned fixed-point transaction rather than to a
@@ -127,16 +144,18 @@ impl PartitionedSchedule {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PartitionedIteration {
     /// Exactly one schedule sweep, accepted by declaration when the per-sweep algorithm accepts
-    /// it (see this enum's docs).
+    /// it (see this enum's docs). No fixed-point driver runs, so nothing is accelerated.
     Once,
-    /// Repeat sweeps until the sup-norm change of the schedule-updated state between sweeps is
-    /// at most `tolerance`, or refuse after `max_sweeps`. `relaxation` in `(0, 1]` is the fixed
-    /// damping applied to each sweep's raw update before it becomes the next sweep's input
-    /// (`1.0` is plain, undamped iteration).
+    /// Methodus's [`accelerate_fixed_point`] over the sweep operator: repeat sweeps until the
+    /// fixed-point residual `‖G(x_k) − x_k‖₂` (the l2 change one sweep makes to the whole
+    /// schedule-updated state) is at most `tolerance` (finite, positive), or refuse after
+    /// `max_sweeps` (at least 2) sweep evaluations. `acceleration` is the one acceleration axis:
+    /// `FixedRelaxation { factor: 1.0 }` is plain iteration, a smaller factor fixed damping,
+    /// `Aitken { initial_factor }` vector Aitken Δ² dynamic relaxation (all Methodus's).
     Implicit {
         tolerance: f64,
         max_sweeps: usize,
-        relaxation: f64,
+        acceleration: AccelerationMethod,
     },
 }
 
@@ -147,12 +166,13 @@ pub struct PartitionedConfig {
     pub iteration: PartitionedIteration,
     /// Per-sweep block Newton controls (`max_iterations` is overridden to `1`: one sweep is
     /// exactly one `solve_blocks` call over the whole schedule). `acceleration` must be `None`:
-    /// a `Some` is refused as `SolveError::InvalidConfiguration` (see the module docs for why
-    /// Krasis's `relaxation` is this transaction's only acceleration axis).
+    /// a `Some` is refused as `SolveError::InvalidConfiguration` (see the module docs: the
+    /// sweep-level [`PartitionedIteration::Implicit::acceleration`] is the one axis).
     pub newton: NewtonConfig,
     /// A sweep (other than the first) is diverged, and refused `PARTITIONED_DIVERGED`, when its
-    /// state change exceeds `divergence_growth` times the previous sweep's (skipped when the
-    /// previous sweep's change is already at the rounding floor). Must be finite and `> 1.0`.
+    /// fixed-point residual `‖G(x) − x‖∞` exceeds `divergence_growth` times the previous sweep's
+    /// (skipped when the previous sweep's residual is already at the rounding floor). Must be
+    /// finite and `> 1.0`.
     pub divergence_growth: f64,
 }
 
@@ -165,32 +185,32 @@ impl PartitionedConfig {
         }
         if self.newton.acceleration.is_some() {
             return Err(SolveError::InvalidConfiguration {
-                reason: "partitioned acceleration is Krasis's relaxation axis until the \
-                         sweep-level consumption of methodus::accelerate_fixed_point lands: set \
-                         PartitionedConfig.newton.acceleration to None and declare \
-                         PartitionedIteration::Implicit::relaxation instead"
+                reason: "partitioned acceleration is declared once, at sweep level, as \
+                         PartitionedIteration::Implicit::acceleration (Methodus's \
+                         accelerate_fixed_point over one schedule sweep); set \
+                         PartitionedConfig.newton.acceleration to None"
                     .into(),
             });
         }
         if let PartitionedIteration::Implicit {
             tolerance,
             max_sweeps,
-            relaxation,
+            ..
         } = &self.iteration
         {
-            if !tolerance.is_finite() || *tolerance < 0.0 {
+            if !tolerance.is_finite() || *tolerance <= 0.0 {
                 return Err(SolveError::InvalidConfiguration {
-                    reason: "partitioned tolerance must be finite and non-negative".into(),
+                    reason: "partitioned tolerance must be finite and positive (it is the \
+                             absolute term of Methodus's fixed-point convergence test)"
+                        .into(),
                 });
             }
-            if *max_sweeps == 0 {
+            if *max_sweeps < 2 {
                 return Err(SolveError::InvalidConfiguration {
-                    reason: "partitioned max_sweeps must be at least 1".into(),
-                });
-            }
-            if !relaxation.is_finite() || *relaxation <= 0.0 || *relaxation > 1.0 {
-                return Err(SolveError::InvalidConfiguration {
-                    reason: "partitioned relaxation must be in (0, 1]".into(),
+                    reason: "partitioned max_sweeps must be at least 2 (Methodus's fixed-point \
+                             driver needs one update between its first and last sweep \
+                             evaluation); a single accepted sweep is PartitionedIteration::Once"
+                        .into(),
                 });
             }
         }
@@ -201,17 +221,19 @@ impl PartitionedConfig {
 /// One sweep's evidence: the schedule's block-Newton trace over the whole sweep (its first entry
 /// is the pre-sweep residual, its last the post-sweep residual -- exactly Methodus's own
 /// `solve_blocks(.., max_iterations = 1, ..)` trace), plus the output-based state-change measure
-/// Krasis evaluates between sweeps.
+/// Krasis's divergence observations evaluate between sweeps.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SweepReport {
     pub sweep: usize,
     pub pre_sweep_residual_norm: f64,
     pub post_sweep_residual_norm: f64,
-    /// Sup-norm change of the whole state between the sweep's input and its raw
-    /// (pre-relaxation) output: the measure Krasis's convergence and divergence tests evaluate.
-    /// Every block the schedule updates contributes, so this is the change of the exchanged
-    /// (schedule-updated) data as a whole -- **not** an interface trace or flux measure; no finer
-    /// per-DOF trace decomposition exists at this composition level.
+    /// Sup-norm change of the whole state between the sweep's input and its raw output
+    /// `‖G(x) − x‖∞`: the measure Krasis's divergence observations evaluate (Methodus's
+    /// convergence test uses the same residual in the l2 norm, recorded in
+    /// [`PartitionedAcceleration::trace`]). Every block the schedule updates contributes, so
+    /// this is the change of the exchanged (schedule-updated) data as a whole -- **not** an
+    /// interface trace or flux measure; no finer per-DOF trace decomposition exists at this
+    /// composition level.
     pub state_change_norm: f64,
     pub block_residual_norms: Vec<(String, f64)>,
     pub newton_trace: Vec<IterationTrace>,
@@ -220,37 +242,52 @@ pub struct SweepReport {
 /// Outcome of a partitioned decomposition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PartitionedDisposition {
-    /// `Implicit` reached its output-based tolerance.
+    /// `Implicit` reached its fixed-point tolerance.
     Converged,
     /// `Once` completed its single sweep, accepted by declaration (see
     /// [`PartitionedIteration`]).
     OnceApplied,
 }
 
+/// Methodus's acceleration evidence for an `Implicit` iteration: the method and its per-sweep
+/// trace (`trace[k]` is sweep `k + 1`'s fixed-point residual `‖G(x_k) − x_k‖₂` and the
+/// relaxation factor applied to it to form the next sweep's input; the terminal entry, the
+/// converged sweep, applies none).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PartitionedAcceleration {
+    pub method: AccelerationMethod,
+    pub trace: Vec<AccelerationIteration>,
+}
+
 /// Full evidence for an accepted partitioned decomposition (`run_partitioned` refuses typed
 /// instead of returning a diverged or exhausted report -- see [`PARTITIONED_DIVERGED`],
-/// [`PARTITIONED_MAX_SWEEPS`]).
+/// [`PARTITIONED_MAX_SWEEPS`], [`PARTITIONED_ACCELERATION_BREAKDOWN`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PartitionedReport {
     pub schedule: PartitionedSchedule,
-    pub relaxation: f64,
+    /// `None` for `Once` (no fixed-point driver ran).
+    pub acceleration: Option<PartitionedAcceleration>,
     pub disposition: PartitionedDisposition,
     pub sweeps: Vec<SweepReport>,
 }
 
-/// An accepted partitioned solve: the state after relaxation, and its report.
+/// An accepted partitioned solve: the terminal sweep's raw output, and its report.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PartitionedSolve {
     pub state: Vec<f64>,
     pub report: PartitionedReport,
 }
 
-fn typed_refusal(code: &str, message: String) -> SolveError {
-    SolveError::Numeric(NumericError::Evaluation {
+fn typed_numeric(code: &str, message: String) -> NumericError {
+    NumericError::Evaluation {
         code: code.to_owned(),
         origin: PARTITIONED_REFUSAL_ORIGIN.to_owned(),
         message,
-    })
+    }
+}
+
+fn typed_refusal(code: &str, message: String) -> SolveError {
+    SolveError::Numeric(typed_numeric(code, message))
 }
 
 fn sup_norm_difference(left: &[f64], right: &[f64]) -> f64 {
@@ -274,7 +311,7 @@ fn residual_norm<Op>(
     operator: &Op,
     context: &EvaluationContext,
     state: &[f64],
-) -> Result<f64, SolveError>
+) -> Result<f64, NumericError>
 where
     Op: NonlinearOperator + ?Sized,
 {
@@ -287,87 +324,100 @@ where
         .sqrt())
 }
 
-/// Runs one partitioned decomposition to [`PartitionedConfig::iteration`]'s bound over any
-/// operator carrying a [`BlockLayout`]: one `solve_blocks` call per sweep (the algorithm
-/// Methodus owns), an output-based (state-change) convergence test and the two divergence
-/// observations Krasis owns (see [`PARTITIONED_DIVERGED`]), and fixed relaxation applied to
-/// each sweep's raw update before it becomes the next sweep's input.
-///
-/// Refuses [`PARTITIONED_DIVERGED`] or [`PARTITIONED_MAX_SWEEPS`] (both
-/// [`NumericError::Evaluation`] with origin [`PARTITIONED_REFUSAL_ORIGIN`], never a silently
-/// accepted iterate) instead of returning a diverged, stalled or exhausted report. The rounding
-/// floor both observations respect is 32 ulps (`NOISE_FLOOR_ULPS`) of `max(1, ‖state‖∞)`: a
-/// previous sweep that changed the state by at most that is at the floor, from which neither
-/// growth nor a failed line search is attributed to the schedule.
-pub fn run_partitioned<Op>(
-    operator: &Op,
-    context: &EvaluationContext,
-    initial_state: &[f64],
-    config: &PartitionedConfig,
-) -> Result<PartitionedSolve, SolveError>
-where
-    Op: BlockNonlinearOperator + ?Sized,
-{
-    config.validate()?;
-    if initial_state.len() != operator.dimension() {
-        return Err(SolveError::Numeric(NumericError::DimensionMismatch {
-            operation: "partitioned initial state".into(),
-            expected: operator.dimension(),
-            actual: initial_state.len(),
-        }));
-    }
-    if let Some(index) = initial_state.iter().position(|value| !value.is_finite()) {
-        return Err(SolveError::Numeric(NumericError::NonFinite {
-            operation: "partitioned initial state".into(),
-            index,
-        }));
+/// What the sweep operator has recorded so far.
+#[derive(Default)]
+struct SweepRecords {
+    sweeps: Vec<SweepReport>,
+    /// The previous sweep's `‖G(x) − x‖∞`, for the growth observation and the rounding floor.
+    previous_change: Option<f64>,
+    /// The latest sweep's raw output `G(x)`: the state an accepted iteration commits.
+    image: Vec<f64>,
+    /// A `solve_blocks` failure that is not a `NumericError` (a refused configuration, a
+    /// singular dense block, ...), kept verbatim so `run_partitioned` returns it unchanged
+    /// instead of the placeholder `evaluate` had to hand Methodus.
+    failure: Option<SolveError>,
+}
+
+/// One schedule sweep as Methodus's [`FixedPointOperator`]: `G(x)` is the raw state after one
+/// `solve_blocks(.., max_iterations = 1, ..)` call from `x`. Krasis's two divergence
+/// observations and the rounding floor live here, so they are made on every sweep whatever
+/// relaxation Methodus applies between sweeps; a sweep's own line-search refusal propagates
+/// through `evaluate` as the typed producer error ([`PARTITIONED_DIVERGED`], or
+/// [`PARTITIONED_MAX_SWEEPS`] from the rounding floor).
+struct SweepOperator<'a, Op: BlockNonlinearOperator + ?Sized> {
+    operator: &'a Op,
+    schedule: PartitionedSchedule,
+    newton: NewtonConfig,
+    divergence_growth: f64,
+    records: Mutex<SweepRecords>,
+}
+
+impl<'a, Op: BlockNonlinearOperator + ?Sized> SweepOperator<'a, Op> {
+    fn new(operator: &'a Op, config: &PartitionedConfig) -> Self {
+        Self {
+            operator,
+            schedule: config.schedule,
+            newton: NewtonConfig {
+                max_iterations: 1,
+                ..config.newton.clone()
+            },
+            divergence_growth: config.divergence_growth,
+            records: Mutex::new(SweepRecords::default()),
+        }
     }
 
-    let (max_sweeps, relaxation, tolerance) = match &config.iteration {
-        PartitionedIteration::Once => (1, 1.0, None),
-        PartitionedIteration::Implicit {
-            tolerance,
-            max_sweeps,
-            relaxation,
-        } => (*max_sweeps, *relaxation, Some(*tolerance)),
-    };
-    let single_sweep = NewtonConfig {
-        max_iterations: 1,
-        ..config.newton.clone()
-    };
-    let schedule = config.schedule.label();
+    fn into_records(self) -> SweepRecords {
+        self.records
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 
-    let mut state = initial_state.to_vec();
-    let mut sweeps = Vec::with_capacity(max_sweeps);
-    let mut previous_change: Option<f64> = None;
-    for sweep in 1..=max_sweeps {
-        let floor = noise_floor(&state);
+impl<Op: BlockNonlinearOperator + ?Sized> FixedPointOperator for SweepOperator<'_, Op> {
+    fn dimension(&self) -> usize {
+        self.operator.dimension()
+    }
+
+    fn evaluate(
+        &self,
+        context: &EvaluationContext,
+        state: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), NumericError> {
+        let mut records = self
+            .records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sweep = records.sweeps.len() + 1;
+        let schedule = self.schedule.label();
+        let floor = noise_floor(state);
+        let previous_change = records.previous_change;
         let previous_above_floor = previous_change.is_some_and(|previous| previous > floor);
         let report = match solve_blocks(
-            operator,
+            self.operator,
             context,
-            &state,
-            config.schedule.strategy(),
-            &single_sweep,
+            state,
+            self.schedule.strategy(),
+            &self.newton,
         ) {
             Ok(report) => report,
             // The whole schedule correction cannot reduce the residual at any admissible
             // damping. From a previous sweep at the rounding floor that is a stall; from
             // anywhere else it is the non-contractive schedule (see `PARTITIONED_DIVERGED`).
             Err(SolveError::LineSearchFailed) => {
-                let residual = residual_norm(operator, context, &state)?;
+                let residual = residual_norm(self.operator, context, state)?;
                 return Err(match previous_change {
-                    Some(previous) if !previous_above_floor => typed_refusal(
+                    Some(previous) if !previous_above_floor => typed_numeric(
                         PARTITIONED_MAX_SWEEPS,
                         format!(
                             "{schedule} schedule stalled at the rounding floor at sweep {sweep} \
-                             of {max_sweeps} without reaching its declared tolerance: the \
-                             previous sweep changed the state by {previous:e} (floor {floor:e}) \
-                             and no admissible damping of this sweep's correction reduces the \
-                             residual {residual:e}"
+                             without reaching its declared tolerance: the previous sweep \
+                             changed the state by {previous:e} (floor {floor:e}) and no \
+                             admissible damping of this sweep's correction reduces the residual \
+                             {residual:e}"
                         ),
                     ),
-                    previous => typed_refusal(
+                    previous => typed_numeric(
                         PARTITIONED_DIVERGED,
                         format!(
                             "sweep {sweep}: no admissible damping of the {schedule} schedule's \
@@ -382,7 +432,12 @@ where
                     ),
                 });
             }
-            Err(other) => return Err(other),
+            Err(SolveError::Numeric(numeric)) => return Err(numeric),
+            Err(other) => {
+                let message = other.to_string();
+                records.failure = Some(other);
+                return Err(NumericError::Operator { message });
+            }
         };
         let pre = report
             .trace
@@ -394,64 +449,169 @@ where
             .expect("solve_blocks records at least one trace entry");
         let pre_residual = pre.scaled_residual_norm;
         let post_residual = post.scaled_residual_norm;
+        let block_residual_norms = post.block_residual_norms.clone();
 
         let raw_next = report.state;
-        let state_change_norm = sup_norm_difference(&raw_next, &state);
-
-        if let Some(previous) = previous_change {
-            if previous_above_floor
-                && (!state_change_norm.is_finite()
-                    || state_change_norm > config.divergence_growth * previous)
-            {
-                return Err(typed_refusal(
-                    PARTITIONED_DIVERGED,
-                    format!(
-                        "sweep {sweep}: the schedule-updated state's change grew from \
-                         {previous:e} to {state_change_norm:e}, exceeding the declared growth \
-                         bound {} ({schedule} schedule)",
-                        config.divergence_growth,
-                    ),
-                ));
-            }
+        let state_change_norm = sup_norm_difference(&raw_next, state);
+        if let Some(previous) = previous_change
+            && previous_above_floor
+            && (!state_change_norm.is_finite()
+                || state_change_norm > self.divergence_growth * previous)
+        {
+            return Err(typed_numeric(
+                PARTITIONED_DIVERGED,
+                format!(
+                    "sweep {sweep}: the schedule-updated state's change grew from {previous:e} \
+                     to {state_change_norm:e}, exceeding the declared growth bound {} \
+                     ({schedule} schedule)",
+                    self.divergence_growth,
+                ),
+            ));
         }
-        previous_change = Some(state_change_norm);
-
-        let mut relaxed = state.clone();
-        for (value, (next, previous)) in relaxed.iter_mut().zip(raw_next.iter().zip(state.iter())) {
-            *value = previous + relaxation * (next - previous);
-        }
-        sweeps.push(SweepReport {
+        records.previous_change = Some(state_change_norm);
+        records.sweeps.push(SweepReport {
             sweep,
             pre_sweep_residual_norm: pre_residual,
             post_sweep_residual_norm: post_residual,
             state_change_norm,
-            block_residual_norms: post.block_residual_norms.clone(),
+            block_residual_norms,
             newton_trace: report.trace,
         });
-        state = relaxed;
+        if output.len() != raw_next.len() {
+            return Err(NumericError::DimensionMismatch {
+                operation: "partitioned sweep output".into(),
+                expected: raw_next.len(),
+                actual: output.len(),
+            });
+        }
+        output.copy_from_slice(&raw_next);
+        records.image = raw_next;
+        Ok(())
+    }
+}
 
-        let disposition = match tolerance {
-            None => PartitionedDisposition::OnceApplied,
-            Some(tolerance) if state_change_norm <= tolerance => PartitionedDisposition::Converged,
-            Some(_) => continue,
-        };
-        return Ok(PartitionedSolve {
-            state,
-            report: PartitionedReport {
-                schedule: config.schedule,
-                relaxation,
-                disposition,
-                sweeps,
-            },
-        });
+/// Runs one partitioned decomposition to [`PartitionedConfig::iteration`]'s bound over any
+/// operator carrying a [`BlockLayout`]: `Once` is one sweep of the sweep operator (one
+/// `solve_blocks(.., max_iterations = 1, ..)` call);
+/// `Implicit` is Methodus's [`accelerate_fixed_point`] over it with `max_sweeps` evaluations
+/// (`max_iterations = max_sweeps − 1` updates), `absolute_tolerance = tolerance` and no relative
+/// term, under the declared [`AccelerationMethod`].
+///
+/// Refuses [`PARTITIONED_DIVERGED`], [`PARTITIONED_MAX_SWEEPS`] or
+/// [`PARTITIONED_ACCELERATION_BREAKDOWN`] (all [`NumericError::Evaluation`] with origin
+/// [`PARTITIONED_REFUSAL_ORIGIN`], never a silently accepted iterate) instead of returning a
+/// diverged, stalled, broken-down or exhausted report. The rounding floor both divergence
+/// observations respect is 32 ulps (`NOISE_FLOOR_ULPS`) of `max(1, ‖state‖∞)`: a previous
+/// sweep that changed the state by at most that is at the floor, from which neither growth nor
+/// a failed line search is attributed to the schedule.
+pub fn run_partitioned<Op>(
+    operator: &Op,
+    context: &EvaluationContext,
+    initial_state: &[f64],
+    config: &PartitionedConfig,
+) -> Result<PartitionedSolve, SolveError>
+where
+    Op: BlockNonlinearOperator + ?Sized,
+{
+    config.validate()?;
+    let dimension = operator.dimension();
+    if initial_state.len() != dimension {
+        return Err(SolveError::Numeric(NumericError::DimensionMismatch {
+            operation: "partitioned initial state".into(),
+            expected: dimension,
+            actual: initial_state.len(),
+        }));
+    }
+    if let Some(index) = initial_state.iter().position(|value| !value.is_finite()) {
+        return Err(SolveError::Numeric(NumericError::NonFinite {
+            operation: "partitioned initial state".into(),
+            index,
+        }));
     }
 
-    Err(typed_refusal(
-        PARTITIONED_MAX_SWEEPS,
-        format!(
-            "{schedule} schedule did not reach its declared tolerance within {max_sweeps} sweeps"
-        ),
-    ))
+    let sweeps = SweepOperator::new(operator, config);
+    let schedule = config.schedule.label();
+    match &config.iteration {
+        PartitionedIteration::Once => {
+            let mut image = vec![0.0; dimension];
+            let outcome = sweeps.evaluate(context, initial_state, &mut image);
+            let records = sweeps.into_records();
+            match outcome {
+                Ok(()) => Ok(PartitionedSolve {
+                    state: image,
+                    report: PartitionedReport {
+                        schedule: config.schedule,
+                        acceleration: None,
+                        disposition: PartitionedDisposition::OnceApplied,
+                        sweeps: records.sweeps,
+                    },
+                }),
+                Err(numeric) => Err(records.failure.unwrap_or(SolveError::Numeric(numeric))),
+            }
+        }
+        PartitionedIteration::Implicit {
+            tolerance,
+            max_sweeps,
+            acceleration,
+        } => {
+            let accelerated = accelerate_fixed_point(
+                &sweeps,
+                context,
+                initial_state,
+                &AccelerationConfig {
+                    method: *acceleration,
+                    max_iterations: max_sweeps - 1,
+                    absolute_tolerance: *tolerance,
+                    relative_tolerance: 0.0,
+                },
+            );
+            let records = sweeps.into_records();
+            match accelerated {
+                Ok(report) => Ok(PartitionedSolve {
+                    state: records.image,
+                    report: PartitionedReport {
+                        schedule: config.schedule,
+                        acceleration: Some(PartitionedAcceleration {
+                            method: *acceleration,
+                            trace: report.trace,
+                        }),
+                        disposition: PartitionedDisposition::Converged,
+                        sweeps: records.sweeps,
+                    },
+                }),
+                Err(SolveError::AccelerationNotConverged { trace }) => Err(typed_refusal(
+                    PARTITIONED_MAX_SWEEPS,
+                    format!(
+                        "{schedule} schedule did not reach its declared tolerance {tolerance:e} \
+                         within {max_sweeps} sweeps under {acceleration:?}: the fixed-point \
+                         residual ‖G(x) − x‖₂ ran {:?}",
+                        trace
+                            .iter()
+                            .map(|entry| entry.residual_norm)
+                            .collect::<Vec<_>>()
+                    ),
+                )),
+                Err(SolveError::AccelerationBreakdown { iteration, reason }) => Err(typed_refusal(
+                    PARTITIONED_ACCELERATION_BREAKDOWN,
+                    format!(
+                        "{acceleration:?} broke down at sweep {} of {max_sweeps} on the \
+                         {schedule} schedule ({reason}); the per-sweep state changes \
+                         ‖G(x) − x‖∞ so far were {:?}",
+                        iteration + 1,
+                        records
+                            .sweeps
+                            .iter()
+                            .map(|sweep| sweep.state_change_norm)
+                            .collect::<Vec<_>>()
+                    ),
+                )),
+                Err(SolveError::Numeric(numeric)) => {
+                    Err(records.failure.unwrap_or(SolveError::Numeric(numeric)))
+                }
+                Err(other) => Err(other),
+            }
+        }
+    }
 }
 
 /// Attaches an externally supplied [`BlockLayout`] to a layout-less nonlinear operator, exactly
@@ -499,13 +659,14 @@ impl BlockNonlinearOperator for LayoutView<'_> {
 /// inside a BDF step through [`crate::CoupledExecution::attempt_step_with`], exactly like
 /// [`methodus::BlockNewton`] or [`methodus::NewtonKrylovSolver`]: the transaction's existing
 /// trial/commit/rollback commits only an accepted step, and a refusal
-/// ([`PARTITIONED_DIVERGED`], [`PARTITIONED_MAX_SWEEPS`]) surfaces as
+/// ([`PARTITIONED_DIVERGED`], [`PARTITIONED_MAX_SWEEPS`],
+/// [`PARTITIONED_ACCELERATION_BREAKDOWN`]) surfaces as
 /// [`crate::KrasisError::EvaluationRefused`] with its code and origin
 /// ([`PARTITIONED_REFUSAL_ORIGIN`]) intact after rollback, logged in
 /// [`crate::CoupledExecution::evaluation_refusals`].
 ///
 /// `SolveReport::converged` is `true` for every accepted solve: a converged `Implicit`
-/// iteration genuinely met its declared output-based tolerance, while an accepted `Once` sweep
+/// iteration genuinely met its declared fixed-point tolerance, while an accepted `Once` sweep
 /// is accepted by declaration (see [`PartitionedIteration`]) -- the step it feeds is a step of
 /// the declared `once` regime, not a projection of the monolithic system, and the run must say
 /// so at the run level.
@@ -514,8 +675,8 @@ impl BlockNonlinearOperator for LayoutView<'_> {
 /// call: `methodus::NonlinearSolver::solve` returns only `methodus::SolveReport`, the same
 /// generic shape `BlockNewton` and `NewtonKrylovSolver` report through today. `solve` returns
 /// every sweep's own Methodus block-Newton trace concatenated in `SolveReport::trace`, so the
-/// per-sweep residual evidence survives; the state-change norms, schedule and relaxation do not
-/// (see `STATUS.md`).
+/// per-sweep residual evidence survives; the state-change norms, schedule and acceleration
+/// trace do not (see `STATUS.md`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PartitionedFixedPoint<'a> {
     layout: &'a BlockLayout,

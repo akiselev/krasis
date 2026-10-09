@@ -1,5 +1,161 @@
 # Krasis status
 
+2026-10-09 W10 lane (packages 1-5 of the W10 Krasis brief) against Finitum `a75baeb` / Methodus
+`a9d97c8`. Owner gate: **93 tests across 14 targets** (`--lib` has no unit tests, `--doc` runs 0):
+coupled_execution 5, coupled_finitum_system 8 (+1), coupled_system 13, e6_block_linear 8,
+fc7_coupled_leaf 1, gx_d1 15, sc_w1_steady_reroute 4, sc_w3_partitioned 12 (+2),
+sv0_verification 6, transactions 5, w8_typed_failures 6, w10_connected_composition 10 (new);
+`cargo fmt -p krasis -- --check`, `cargo check --all-targets`, strict all-feature clippy,
+`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` and doctests clean; numerical targets at
+`CARGO_PROFILE_TEST_OPT_LEVEL=2`. The 80 pre-W10 tests keep their meaning; the shape changes
+they absorbed are listed under package 3.
+
+- **Package 1 -- weighted Jacobi through Finitum's `system_linearized_diagonal`.**
+  `ConnectedSystemOperator` retains the `ConnectionRealizationPlan` and the two endpoint leaf
+  indices (`new`: always; `new_system`: when it carries exactly one relation over exactly two
+  operators and the composed constraints are the relation's own, same targets/dependencies/
+  orientation -- a union-find re-orientation of reversed ports falls back). For that pair shape
+  `DaeOperator::jacobian_diagonal` is now Finitum's `diag(Rᵀ J R)`: the per-leaf slices of the
+  connection-reduced state/rate go to `plan.system_linearized_diagonal([&a, &b], time, slices,
+  rates, rate_shift)` and its `[a; b]` result is scattered into the leaf ranges (preserved under
+  elimination). The former Krasis-side sum-of-leaf-diagonals path remains only for the
+  multi-relation union shape Finitum does not cover (`new_system` with several relations or more
+  than two leaves); the weight-1 shortcut that returned `None` for every weighted connection is
+  gone. The existing `graph().dependencies()` refusal (edges inside a connected composition)
+  is kept. New accessor `ConnectedSystemOperator::has_connected_diagonal()`. Proofs
+  (`tests/w10_connected_composition.rs`, on the package 2 fixtures):
+  `matching_connected_diagonal_is_finitums_and_equals_the_sum_of_leaf_convention` (bit-equal to
+  Finitum's call, 0 relative discrepancy against exhaustive unit-vector probing of Krasis's own
+  `jacobian_vector_product`, within 1e-12 of the old convention, target rows 1.0);
+  `nested_p1_connected_diagonal_is_some_and_matches_exhaustive_probing` (weighted connection,
+  `Some`, 0 discrepancy, cross term non-vacuous, steady view identical at shift 0);
+  `nested_p1_transient_connected_diagonal_sees_rate_shift_at_the_expanded_point` (storage-bearing
+  state-dependent fixture, deliberately wrong target entries in the reduced slice, shifts 0 and
+  3, worst 2.5e-16); `nested_p1_newton_krylov_with_jacobi_converges_and_agrees_with_the_
+  unpreconditioned_solve` (GMRES Newton-Krylov, `JacobiFactory` vs none vs dense Newton within
+  1e-8; Krylov iterations Jacobi 19 vs 23 unpreconditioned at k=[2,3], 22 vs 24 at k=[1,50]).
+  No operator identity, layout, checkpoint identity or refusal code consumed by Sinbad changed.
+- **Package 2 -- a real matching-fixture partitioned agreement gate** (ARCHITECTURE gate item 9).
+  `tests/support/mod.rs` is the reusable scaffolding W9 lacked: `steady_fixture` /
+  `transient_fixture` build the `TwoMaterials` system of the copied Finitum
+  `two-material-conduction.res` / `two-material-transient-conduction.res` over two simplex boxes,
+  `Interface::Matching { subdivisions }` or `Interface::NestedP1 { coarse, fine }`
+  (`ConnectionRealizationPlan::matching` / `nested_p1`), closed-form constitutive closures,
+  essential (Dirichlet) values over each side's **whole far face**, two `ReducedSystemOperator`
+  leaves (second instance's semantic ids re-keyed), `CoupledSystemOperator::new` without edges
+  and `ConnectedSystemOperator::new`; the struct exposes the operator, the uneliminated inner
+  composition, both reduced operators, the plan and its pair constraints, meshes, essential
+  vertices, and `sampled`/`committed_state`/`zero_state` helpers. Gate
+  (`matching_partitioned_transaction_agrees_with_monolithic_newton_and_refuses_cleanly`,
+  `nested_p1_partitioned_transaction_agrees_with_monolithic_newton_for_both_schedules`):
+  `PartitionedExecution` serial and parallel `Implicit` solves agree with monolithic dense Newton
+  within 1e-8 (measured 6.7e-12 serial / 2.5e-11 parallel on matching, 6.1e-12 / 4.3e-11 on
+  nested_p1; plain sweeps 31/59 matching, 33/62 nested_p1), the committed state and
+  `PartitionedReport` (schedule, acceleration method and per-sweep trace, sweeps) are recorded,
+  and a refused solve (`PARTITIONED_MAX_SWEEPS`, budget 2 at tolerance 1e-300) leaves the
+  committed state bit-identical. The same gate holds under Aitken (serial 4 sweeps, parallel 25).
+  Transient: `transient_matching_partitioned_fixed_point_inside_bdf_agrees_with_dense_newton_
+  per_step` runs the storage-bearing matching pair through `CoupledExecution` (BDF1, four fixed
+  steps) with `PartitionedFixedPoint` against dense Newton: 5.7e-14 per accepted step (gate
+  1e-9), no refusals. Finding recorded while building it: with ONE pinned vertex per side (the
+  construction Finitum's Jacobian-only tests use) both subdomains are nearly floating, the
+  serial splitting contracts at about 0.89 (250 sweeps to 1e-10 on matching) and the parallel
+  one at about 0.94 (not within 400 sweeps), and Jacobi cost GMRES 41 Krylov iterations against
+  39 unpreconditioned on nested_p1 k=[2,3]; pinning the whole far face (the physical Dirichlet
+  face) gives the counts above. The fixture pins the face; the one-vertex numbers are the reason.
+- **Package 3 -- sweep-level acceleration through `methodus::accelerate_fixed_point`.** Krasis's
+  own `relaxation` is gone. One schedule sweep (`solve_blocks(.., max_iterations = 1, ..)` from
+  `x`, raw output `G(x)`) is a `methodus::FixedPointOperator` (private `SweepOperator`), and
+  `Implicit` is Methodus's `accelerate_fixed_point` over it with `max_iterations = max_sweeps -
+  1` (exactly `max_sweeps` sweep evaluations), `absolute_tolerance = tolerance`,
+  `relative_tolerance = 0`, under the declared `AccelerationMethod` -- the one acceleration axis.
+  `NewtonConfig.acceleration` stays refused inside the transaction (it would double the axis).
+  Shapes (nobody outside Krasis consumes `PartitionedConfig`/`PartitionedReport` bytes: Sinbad
+  does not expose partitioned policy yet, verified by grep over `sinbad/src`):
+  `PartitionedIteration::Implicit { tolerance, max_sweeps, acceleration:
+  methodus::AccelerationMethod }` replaces `{ tolerance, max_sweeps, relaxation: f64 }`;
+  `PartitionedReport { schedule, acceleration: Option<PartitionedAcceleration { method, trace:
+  Vec<methodus::AccelerationIteration> }>, disposition, sweeps }` replaces `relaxation: f64`
+  (`None` for `Once`, which runs one sweep of the same operator and no driver); new refusal code
+  `PARTITIONED_ACCELERATION_BREAKDOWN` (same origin `PARTITIONED_REFUSAL_ORIGIN`). Convergence
+  is now Methodus's `‖G(x_k) − x_k‖₂ ≤ tolerance` (the same whole-state change the pre-W10 loop
+  measured, in the l2 norm instead of the sup norm; l2 ≥ sup, so a converged iteration meets the
+  old test too; `SweepReport::state_change_norm` keeps the sup norm). Restated declarations:
+  `tolerance` must be finite and positive (was `≥ 0`; the stall test's declared `0.0` became
+  `1e-300`, no normal double between them) and `max_sweeps ≥ 2` (was `≥ 1`; a single accepted
+  sweep is `Once`). The committed state is the terminal sweep's raw output `G(x_k)` (not
+  Methodus's returned iterate `x_k`; they differ by at most the tolerance), which for
+  `FixedRelaxation { factor: 1.0 }` is exactly the pre-W10 result. Refusal mapping, all inside
+  the operator or around the driver: a sweep's `LineSearchFailed` → `PARTITIONED_DIVERGED`
+  (or `PARTITIONED_MAX_SWEEPS` "stalled at the rounding floor" when the previous sweep was at
+  the 32-ulp floor, as before); the sweep-over-sweep growth observation (`divergence_growth`,
+  on `‖G(x) − x‖∞`) → `PARTITIONED_DIVERGED`; Methodus `AccelerationNotConverged { trace }` →
+  `PARTITIONED_MAX_SWEEPS` with the residual history quoted; `AccelerationBreakdown` →
+  `PARTITIONED_ACCELERATION_BREAKDOWN` with the sweep, Methodus's reason and Krasis's per-sweep
+  change history (no fixture in the suite triggers a breakdown; the mapping is exercised by type
+  only -- recorded open); any other `solve_blocks` failure is returned verbatim. Proofs
+  (`tests/sc_w3_partitioned.rs`): `fixed_relaxation_one_reproduces_plain_iteration_bit_for_bit`
+  (a written-out plain sweep loop and `run_partitioned` under `FixedRelaxation { 1.0 }` give
+  the same sweep count, 4, and a bit-identical state; the report records method, per-sweep
+  factors `Some(1.0)` and a terminal `None`);
+  `aitken_converges_in_fewer_sweeps_than_plain_iteration_on_a_slowly_contracting_schedule`
+  (wrong-role strength 24, serial-splitting spectral radius 0.668 by power iteration: Aitken 10
+  sweeps vs plain 62, both within 1e-8 of monolithic Newton, Aitken factors genuinely
+  recomputed); the package 2 gate under Aitken (above); all ten pre-W10 tests pass unchanged in
+  meaning with `acceleration: FixedRelaxation { factor: 1.0 }` in place of `relaxation: 1.0`.
+- **Package 4 -- block coupling actions and per-block diagonals for Methodus's block
+  Gauss-Seidel.** `krasis::BlockGaussSeidelFactory<'op, Op: BlockNonlinearOperator>` (new module
+  `block_preconditioner`) implements `methodus::PreconditionerFactory` -- the shape Sinbad
+  consumes for `JacobiFactory` in `connected_run.rs` -- over `CoupledSystemOperator` or
+  `ConnectedSystemOperator`: `BlockLayout` = the operator's leaf blocks; per-block diagonal
+  solves = `BlockDiagonalPreconditioner` over the block's slice of the operator's own
+  `jacobian_diagonal` at the iterate (an operator without one refuses typed, as `JacobiFactory`
+  does); couplings = `krasis::BlockCoupling` for every ordered pair of distinct blocks, each
+  `A_ij · v` computed as the **masked full JVP** (zero-pad into block `j`, the operator's
+  `jacobian_vector_product` at the frozen point, restrict to block `i`) -- exact by definition
+  for this bounded shape, one JVP per application; the cheaper edge/connection-structural
+  assembly is not done. `transpose_of` is declared nowhere (Krasis knows no owner-declared
+  transposed structure), so the symmetric sweep declares `Unknown` (CG/MINRES refuse by design)
+  and forward/backward `Nonsymmetric`; nothing is tested numerically and then declared.
+  Because `methodus::BlockGaussSeidelPreconditioner::new` borrows its parts, the factory returns
+  a Krasis owner that rebuilds the validated Methodus view per application (a bounded
+  validation, no algorithm). `CoupledSystemOperator` gained `DaeOperator`/`NonlinearOperator::
+  jacobian_diagonal` = the concatenation of its leaves' diagonals (every edge entry is in an
+  off-diagonal leaf block), `None` when a leaf supplies none; Sinbad builds Jacobi over a
+  `ReducedSystemOperator` (`run.rs`) and a `ConnectedSystemOperator` (`connected_run.rs`), never
+  over a `CoupledSystemOperator`, so no consumer behaviour changes. Proofs:
+  `block_coupling_actions_equal_the_masked_jacobian_vector_product_on_both_fixtures` (matching
+  and nested_p1: 0 vs the masked JVP, ≤ 1.9e-16 relative vs the action assembled from
+  unit-vector Jacobian columns, actions non-trivial, `transpose_of() == None`);
+  `gmres_with_block_gauss_seidel_agrees_with_jacobi_and_takes_no_more_krylov_iterations`
+  (matching: Forward 26 and Symmetric 25 Krylov iterations vs Jacobi 27, agreement 3.0e-11 /
+  5.1e-11, declarations `Nonsymmetric` / `Unknown` asserted);
+  `coupled_system_diagonal_is_the_concatenation_of_leaf_diagonals` (no edges) and
+  `tests/coupled_finitum_system.rs::coupled_system_diagonal_is_exact_with_a_sampling_edge`
+  (sampling edge present, rate shift 2, 1e-12 against probing).
+- **Honestly open.** N-way junctions and the multi-relation (union) connected diagonal (Finitum
+  covers one relation over two operators; Krasis keeps the sum-of-leaf convention there, with
+  its weight-1 precondition); a `new_system` pair whose ports are reversed relative to the
+  operator order falls back to that convention when the union-find re-orients the relation;
+  transient nonmatching composition (pending Finitum); the structural (exchange-based) coupling
+  action; an Aitken-breakdown fixture (the `PARTITIONED_ACCELERATION_BREAKDOWN` path is mapped,
+  not exercised); the BDF-embedded `PartitionedFixedPoint` still reports only the generic
+  `SolveReport` (acceleration trace not recoverable there, as before).
+- **Cross-repo needs.** *Sinbad* (next lane): `preconditioner = "block_gauss_seidel"` builds
+  `krasis::BlockGaussSeidelFactory::new(&operator, methodus::GaussSeidelSweep::Forward)` (or
+  `Symmetric`) over the same operator it hands `solve_newton_krylov`, and passes `Some(&factory
+  as &dyn methodus::PreconditionerFactory)` exactly where `connected_run.rs` passes
+  `JacobiFactory`; CG/MINRES refuse the symmetric sweep (`Unknown`) by design and GMRES/BiCGStab
+  accept both; `nested_p1` Jacobi is now available through the same `JacobiFactory`
+  (`ConnectedSystemOperator::has_connected_diagonal()`); a partitioned policy would serialize
+  `PartitionedConfig { schedule, iteration: Implicit { tolerance, max_sweeps ≥ 2, acceleration:
+  fixed_relaxation { factor } | aitken { initial_factor } } | Once, newton (acceleration None),
+  divergence_growth }` and read `PartitionedReport.acceleration`. *Methodus* (optional, would
+  simplify): an owning `BlockGaussSeidelPreconditioner` constructor (boxed/`Arc` parts) so a
+  factory can return it directly instead of a rebuilding owner; `AccelerationBreakdown` carrying
+  its trace like `AccelerationNotConverged`. *Finitum* (later): `system_linearized_diagonal` for
+  several relations / more than two operators.
+
 2026-10-08 SC-W3 review fixes on `06deede` (pre-publication). `tests/sc_w3_partitioned.rs` is
 now 10 tests; owner gate 80 tests across 12 targets (70 unchanged across 10 targets plus the 10
 here; `--lib` has no unit tests and `--doc` runs 0), formatting, `cargo check`, strict
@@ -142,9 +298,10 @@ is pending. Finitum dependency: `2de7dd8cfcf173f364114728c590402ccc4d820c`.
 Evidence: `docs/validation/2026-09-17-sc-w2/`.
 
 
-Updated: 2026-10-08
-Milestone: SC-W3 package 1/2, the partitioned fixed-point transaction, with the pre-publication
-review fixes.
+Updated: 2026-10-09
+Milestone: W10 -- Finitum-routed connected Jacobi (weighted `nested_p1` included), the real
+matching-fixture partitioned agreement gate, sweep-level acceleration through Methodus, and the
+block Gauss-Seidel factory.
 
 ## Ownership
 
@@ -245,6 +402,9 @@ stops callback evaluation while preserving the producer refusal.
 
 ## Validation
 
+- W10 (2026-10-09): 93 tests across 14 targets against Finitum `a75baeb` / Methodus `a9d97c8`,
+  none ignored; scoped formatting, all-target all-feature clippy with warnings denied, rustdoc
+  with warnings denied and doctests passed (details in the 2026-10-09 entry).
 - Before final F3 removal, full 70 tests passed against Finitum `5bd93cc`, none ignored.
   Focused patch forwarding, all-target clippy, rustdoc and scoped formatting passed.
 - Final F3 gate against Finitum `23e9fd8`: all 70 tests passed, none failed or ignored;

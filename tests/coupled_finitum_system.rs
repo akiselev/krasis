@@ -939,3 +939,61 @@ fn prescribed_motion_changes_checkpoint_identity_and_static_identity_stays_exact
     ));
     assert_eq!(different.checkpoint().unwrap(), before);
 }
+
+/// W10 package 4: a `CoupledSystemOperator`'s Jacobian diagonal is the concatenation of its
+/// leaves' own diagonals -- exact with a cross-leaf edge present, because every edge entry lies
+/// in an off-diagonal leaf block -- checked against unit-vector probing of the full composed
+/// `jacobian_vector_product` (edge included) at a nonzero rate shift.
+#[test]
+fn coupled_system_diagonal_is_exact_with_a_sampling_edge() {
+    let compiled = compile();
+    let fixture = two_heat_leaves(&compiled, 0.5);
+    let operator = &fixture.operator;
+    let context = EvaluationContext::reproducible();
+    let dimension = DaeOperator::dimension(operator);
+    let state = initial_values(&fixture);
+    let rate = probe_vector(dimension, 3.0, 0.1);
+    let rate_shift = 2.0;
+    let diagonal =
+        DaeOperator::jacobian_diagonal(operator, &context, 0.0, &state, &rate, rate_shift)
+            .unwrap()
+            .expect("both reduced-system leaves supply a diagonal");
+    assert_eq!(diagonal.len(), dimension);
+    let hot = operator.leaf_range(0).unwrap();
+    let cold = operator.leaf_range(1).unwrap();
+    let mut unit = vec![0.0; dimension];
+    let mut rate_direction = vec![0.0; dimension];
+    let mut output = vec![0.0; dimension];
+    let mut edge_seen = false;
+    for column in 0..dimension {
+        unit[column] = 1.0;
+        rate_direction[column] = rate_shift;
+        DaeOperator::jacobian_vector_product(
+            operator,
+            &context,
+            0.0,
+            &state,
+            &rate,
+            &unit,
+            &rate_direction,
+            &mut output,
+        )
+        .unwrap();
+        unit[column] = 0.0;
+        rate_direction[column] = 0.0;
+        assert!(
+            (diagonal[column] - output[column]).abs() <= 1e-12 * output[column].abs().max(1.0),
+            "row {column}: coupled diagonal {} != probe {}",
+            diagonal[column],
+            output[column]
+        );
+        // The edge (cold rows read hot state) is present, so the claim is not vacuous.
+        if hot.contains(&column) && output[cold.clone()].iter().any(|value| *value != 0.0) {
+            edge_seen = true;
+        }
+    }
+    assert!(
+        edge_seen,
+        "the sampling edge contributed nothing off the diagonal"
+    );
+}

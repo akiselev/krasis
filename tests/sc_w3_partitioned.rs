@@ -29,8 +29,8 @@ use krasis::{
 };
 use methodus::{
     AccelerationMethod, BdfConfig, BdfOrder, BlockLayout, BlockNonlinearOperator, BlockSpec,
-    CsrMatrix, DaeOperator, EvaluationContext, NewtonConfig, NonlinearOperator, NumericError,
-    SolveError, StepOutcome, solve_newton,
+    BlockStrategy, CsrMatrix, DaeOperator, EvaluationContext, NewtonConfig, NonlinearOperator,
+    NumericError, SolveError, StepOutcome, solve_blocks, solve_newton,
 };
 use quantitas::UnitRegistry;
 use scientia::{
@@ -413,7 +413,7 @@ fn implicit_config(
         iteration: PartitionedIteration::Implicit {
             tolerance,
             max_sweeps,
-            relaxation: 1.0,
+            acceleration: AccelerationMethod::FixedRelaxation { factor: 1.0 },
         },
         newton: NewtonConfig {
             max_iterations: 100,
@@ -640,7 +640,8 @@ fn partitioned_acceleration_is_refused_as_invalid_configuration_and_commits_noth
     );
     assert_eq!(execution.state().committed_vector().unwrap(), before);
 
-    // Methodus's fixed relaxation is refused the same way: Krasis's `relaxation` is the one axis.
+    // Methodus's per-call fixed relaxation is refused the same way: the sweep-level
+    // `PartitionedIteration::Implicit::acceleration` is the one axis.
     config.newton.acceleration = Some(AccelerationMethod::FixedRelaxation { factor: 0.7 });
     assert!(matches!(
         run_partitioned(&operator, &context, &vec![0.0; dimension], &config),
@@ -736,16 +737,18 @@ impl BlockNonlinearOperator for TwoBlockLinear {
 fn a_stall_at_the_rounding_floor_is_refused_max_sweeps_never_diverged() {
     let operator = TwoBlockLinear::new();
     let context = EvaluationContext::reproducible();
-    // Tolerances no floating-point iterate can meet: the state change must reach exactly zero
-    // while Methodus's per-sweep residual threshold is about 1e-300, so the contractive
-    // iteration reaches the rounding floor and can then only stall (a failed line search on
-    // rounding noise) or exhaust its bound -- never be judged diverging.
+    // Tolerances no floating-point iterate can meet: the fixed-point residual must fall to
+    // 1e-300 (W10 restated this from the former exact zero, which Methodus's fixed-point driver
+    // refuses as a configuration; no normal double lies between the two) while Methodus's
+    // per-sweep residual threshold is about 1e-300, so the contractive iteration reaches the
+    // rounding floor and can then only stall (a failed line search on rounding noise) or
+    // exhaust its bound -- never be judged diverging.
     let config = PartitionedConfig {
         schedule: PartitionedSchedule::Serial,
         iteration: PartitionedIteration::Implicit {
-            tolerance: 0.0,
+            tolerance: 1.0e-300,
             max_sweeps: 80,
-            relaxation: 1.0,
+            acceleration: AccelerationMethod::FixedRelaxation { factor: 1.0 },
         },
         newton: NewtonConfig {
             absolute_tolerance: 0.0,
@@ -1022,7 +1025,7 @@ fn a_non_contractive_wrong_role_schedule_is_refused_diverged_under_once_and_impl
         PartitionedIteration::Implicit {
             tolerance: 1.0e-10,
             max_sweeps: budget,
-            relaxation: 1.0,
+            acceleration: AccelerationMethod::FixedRelaxation { factor: 1.0 },
         },
     ] {
         let config = PartitionedConfig {
@@ -1073,4 +1076,162 @@ fn a_non_contractive_wrong_role_schedule_is_refused_diverged_under_once_and_impl
         .unwrap();
     assert_eq!(report.disposition, PartitionedDisposition::Converged);
     assert!(report.sweeps.len() < budget);
+}
+
+// -------------------------------------------------------------------------------------------
+// W10 package 3: sweep-level acceleration through `methodus::accelerate_fixed_point`
+// -------------------------------------------------------------------------------------------
+
+/// Plain partitioned iteration written out: one `solve_blocks(.., max_iterations = 1, ..)`
+/// sweep per step, next input = the sweep's raw output, stop when the l2 change of one sweep is
+/// at most `tolerance`; returns the terminal sweep's output and the sweep count.
+fn plain_iteration_reference(
+    operator: &CoupledSystemOperator,
+    context: &EvaluationContext,
+    config: &PartitionedConfig,
+    tolerance: f64,
+) -> (Vec<f64>, usize) {
+    let single_sweep = NewtonConfig {
+        max_iterations: 1,
+        ..config.newton.clone()
+    };
+    let mut state = vec![0.0; NonlinearOperator::dimension(operator)];
+    let mut sweeps = 0;
+    loop {
+        let image = solve_blocks(
+            operator,
+            context,
+            &state,
+            BlockStrategy::GaussSeidel,
+            &single_sweep,
+        )
+        .unwrap()
+        .state;
+        sweeps += 1;
+        let change: Vec<f64> = image.iter().zip(&state).map(|(g, x)| g - x).collect();
+        if l2(&change) <= tolerance {
+            return (image, sweeps);
+        }
+        state = image;
+        assert!(sweeps < 1000, "reference iteration did not converge");
+    }
+}
+
+#[test]
+fn fixed_relaxation_one_reproduces_plain_iteration_bit_for_bit() {
+    let operator = two_block_diffusion(0.3);
+    let context = EvaluationContext::reproducible();
+    let tolerance = 1.0e-10;
+    let config = implicit_config(PartitionedSchedule::Serial, tolerance, 200);
+    assert_eq!(
+        config.iteration,
+        PartitionedIteration::Implicit {
+            tolerance,
+            max_sweeps: 200,
+            acceleration: AccelerationMethod::FixedRelaxation { factor: 1.0 },
+        }
+    );
+    let (reference, reference_sweeps) =
+        plain_iteration_reference(&operator, &context, &config, tolerance);
+    let dimension = NonlinearOperator::dimension(&operator);
+    let solved = run_partitioned(&operator, &context, &vec![0.0; dimension], &config).unwrap();
+    eprintln!(
+        "plain iteration: {reference_sweeps} reference sweeps, {} accelerated sweeps",
+        solved.report.sweeps.len()
+    );
+    assert_eq!(solved.report.sweeps.len(), reference_sweeps);
+    // The update `x + 1.0 * (G(x) - x)` is `G(x)` and the committed state is the terminal
+    // sweep's raw output, so the two runs are the same floating-point sequence.
+    assert_eq!(solved.state, reference);
+    let evidence = solved.report.acceleration.unwrap();
+    assert_eq!(
+        evidence.method,
+        AccelerationMethod::FixedRelaxation { factor: 1.0 }
+    );
+    assert_eq!(evidence.trace.len(), reference_sweeps);
+    let (terminal, applied) = evidence.trace.split_last().unwrap();
+    assert_eq!(terminal.relaxation_factor, None);
+    assert!(
+        applied
+            .iter()
+            .all(|entry| entry.relaxation_factor == Some(1.0))
+    );
+    assert!(terminal.residual_norm <= tolerance);
+    // Methodus's l2 fixed-point residual is what each sweep's sup-norm change bounds.
+    for (entry, sweep) in evidence.trace.iter().zip(&solved.report.sweeps) {
+        assert!(sweep.state_change_norm <= entry.residual_norm * (1.0 + 1e-12));
+    }
+}
+
+#[test]
+fn aitken_converges_in_fewer_sweeps_than_plain_iteration_on_a_slowly_contracting_schedule() {
+    // Strength 24 of the wrong-role family: serial-splitting spectral radius about
+    // (24 / 29.4)^2 = 0.67, established independently of the driver.
+    let operator = two_block_diffusion_wrong_role(24.0);
+    let radius = serial_schedule_spectral_radius(&operator);
+    eprintln!("wrong-role strength 24: serial-splitting spectral radius {radius:.4}");
+    assert!(
+        (0.5..0.9).contains(&radius),
+        "the fixture must contract slowly: spectral radius {radius}"
+    );
+    let context = EvaluationContext::reproducible();
+    let dimension = NonlinearOperator::dimension(&operator);
+    let newton = implicit_config(PartitionedSchedule::Serial, 1.0e-10, 400).newton;
+    let monolithic = solve_newton(&operator, &context, &vec![0.0; dimension], &newton).unwrap();
+    assert!(monolithic.converged);
+
+    let mut counts = Vec::new();
+    for acceleration in [
+        AccelerationMethod::FixedRelaxation { factor: 1.0 },
+        AccelerationMethod::Aitken {
+            initial_factor: 1.0,
+        },
+    ] {
+        let config = PartitionedConfig {
+            schedule: PartitionedSchedule::Serial,
+            iteration: PartitionedIteration::Implicit {
+                tolerance: 1.0e-10,
+                max_sweeps: 400,
+                acceleration,
+            },
+            newton: newton.clone(),
+            divergence_growth: 10.0,
+        };
+        let mut execution = PartitionedExecution::new(&operator, zero_state(&operator)).unwrap();
+        let report = execution.solve(&context, &config, 0.0).unwrap();
+        assert_eq!(report.disposition, PartitionedDisposition::Converged);
+        let disagreement = max_abs_difference(
+            &execution.state().committed_vector().unwrap(),
+            &monolithic.state,
+        );
+        let evidence = report.acceleration.as_ref().unwrap();
+        eprintln!(
+            "{acceleration:?}: {} sweeps, vs monolithic {disagreement:e}, factors {:?}",
+            report.sweeps.len(),
+            evidence
+                .trace
+                .iter()
+                .filter_map(|entry| entry.relaxation_factor)
+                .collect::<Vec<_>>()
+        );
+        assert!(disagreement < 1.0e-8, "{acceleration:?}: {disagreement}");
+        if matches!(acceleration, AccelerationMethod::Aitken { .. }) {
+            // Aitken genuinely recomputed its factor after the first sweep.
+            assert!(
+                evidence
+                    .trace
+                    .iter()
+                    .skip(1)
+                    .filter_map(|entry| entry.relaxation_factor)
+                    .any(|factor| (factor - 1.0).abs() > 1e-6)
+            );
+        }
+        counts.push(report.sweeps.len());
+    }
+    assert!(
+        counts[1] < counts[0],
+        "Aitken took {} sweeps, plain iteration {}",
+        counts[1],
+        counts[0]
+    );
 }
