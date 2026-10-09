@@ -176,11 +176,17 @@ impl<Op: BlockNonlinearOperator + ?Sized> std::fmt::Debug for BlockGaussSeidelFa
 }
 
 impl<'op, Op: BlockNonlinearOperator + ?Sized> BlockGaussSeidelFactory<'op, Op> {
+    /// A factory over `operator`'s leaf blocks, building the declared `sweep` of a block
+    /// Gauss-Seidel preconditioner at every point `build` is called with. The factory linearizes
+    /// the operator's steady `NonlinearOperator` view (zero rate, no rate shift), which is the
+    /// view a steady Newton-Krylov solve over the same operator re-linearizes per iterate; it does
+    /// not serve a BDF stage solve, whose operator is the stage operator, not this block operator.
     #[must_use]
     pub const fn new(operator: &'op Op, sweep: GaussSeidelSweep) -> Self {
         Self { operator, sweep }
     }
 
+    /// The declared sweep pattern.
     #[must_use]
     pub const fn sweep(&self) -> GaussSeidelSweep {
         self.sweep

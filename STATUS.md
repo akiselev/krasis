@@ -1,10 +1,10 @@
 # Krasis status
 
 2026-10-09 W10 lane (packages 1-5 of the W10 Krasis brief) against Finitum `a75baeb` / Methodus
-`a9d97c8`. Owner gate: **93 tests across 14 targets** (`--lib` has no unit tests, `--doc` runs 0):
+`a9d97c8`. Owner gate: **94 tests across 14 targets** (`--lib` has no unit tests, `--doc` runs 0):
 coupled_execution 5, coupled_finitum_system 8 (+1), coupled_system 13, e6_block_linear 8,
 fc7_coupled_leaf 1, gx_d1 15, sc_w1_steady_reroute 4, sc_w3_partitioned 12 (+2),
-sv0_verification 6, transactions 5, w8_typed_failures 6, w10_connected_composition 10 (new);
+sv0_verification 6, transactions 5, w8_typed_failures 6, w10_connected_composition 11 (new);
 `cargo fmt -p krasis -- --check`, `cargo check --all-targets`, strict all-feature clippy,
 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` and doctests clean; numerical targets at
 `CARGO_PROFILE_TEST_OPT_LEVEL=2`. The 80 pre-W10 tests keep their meaning; the shape changes
@@ -85,7 +85,9 @@ they absorbed are listed under package 3.
   `1e-300`, no normal double between them) and `max_sweeps ≥ 2` (was `≥ 1`; a single accepted
   sweep is `Once`). The committed state is the terminal sweep's raw output `G(x_k)` (not
   Methodus's returned iterate `x_k`; they differ by at most the tolerance), which for
-  `FixedRelaxation { factor: 1.0 }` is exactly the pre-W10 result. Refusal mapping, all inside
+  `FixedRelaxation { factor: 1.0 }` reproduces the pre-W10 result (bit-for-bit on the suite's
+  fixtures; Methodus applies `x + 1.0 · (G(x) − x)`, equal to `G(x)` only when that difference is
+  exact, so a rounding-level difference is possible in general). Refusal mapping, all inside
   the operator or around the driver: a sweep's `LineSearchFailed` → `PARTITIONED_DIVERGED`
   (or `PARTITIONED_MAX_SWEEPS` "stalled at the rounding floor" when the previous sweep was at
   the 32-ulp floor, as before); the sweep-over-sweep growth observation (`divergence_growth`,
@@ -140,7 +142,14 @@ they absorbed are listed under package 3.
   transient nonmatching composition (pending Finitum); the structural (exchange-based) coupling
   action; an Aitken-breakdown fixture (the `PARTITIONED_ACCELERATION_BREAKDOWN` path is mapped,
   not exercised); the BDF-embedded `PartitionedFixedPoint` still reports only the generic
-  `SolveReport` (acceleration trace not recoverable there, as before).
+  `SolveReport` (acceleration trace not recoverable there, as before); `BlockGaussSeidelFactory`
+  linearizes the operator's steady `NonlinearOperator` view (zero rate, no rate shift), the view
+  a steady Newton-Krylov over the same operator re-linearizes per iterate -- it cannot serve a
+  BDF stage solve, whose operator is the stage operator, not this block operator. Pre-publication
+  review (2026-10-09) added `new_system_admits_the_finitum_diagonal_for_the_production_pair_shape`
+  (`new_system`, Sinbad's constructor, admits the pair shape on both fixtures and its diagonal is
+  bit-equal to the `new` path's), rustdoc on the factory constructor, and this paragraph; owner
+  gate 94 tests across 14 targets.
 - **Cross-repo needs.** *Sinbad* (next lane): `preconditioner = "block_gauss_seidel"` builds
   `krasis::BlockGaussSeidelFactory::new(&operator, methodus::GaussSeidelSweep::Forward)` (or
   `Symmetric`) over the same operator it hands `solve_newton_krylov`, and passes `Some(&factory

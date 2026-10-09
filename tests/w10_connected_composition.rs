@@ -175,6 +175,58 @@ fn steady_point(fixture: &ConnectedFixture) -> Vec<f64> {
 // -------------------------------------------------------------------------------------------
 
 #[test]
+fn new_system_admits_the_finitum_diagonal_for_the_production_pair_shape() {
+    // Sinbad builds its connected operator through `new_system` (connected_run.rs), never through
+    // `new`; the pair admission that decides whether Finitum's diagonal is used must hold there.
+    for (label, interface, conductivity) in [
+        ("matching", MATCHING, [2.5, 3.0]),
+        ("nested_p1", NESTED, [2.0, 3.0]),
+    ] {
+        let fixture = steady_fixture(interface, conductivity, DIRICHLET);
+        let via_system = ConnectedSystemOperator::new_system(
+            fixture.inner.clone(),
+            std::slice::from_ref(&fixture.plan),
+            &[&fixture.reduced[0], &fixture.reduced[1]],
+        )
+        .unwrap_or_else(|error| panic!("{label}: new_system refused: {error}"));
+        assert!(
+            via_system.has_connected_diagonal(),
+            "{label}: new_system admits the one-relation two-operator pair shape"
+        );
+        assert_eq!(DaeOperator::dimension(&via_system), fixture.dimension());
+        let context = EvaluationContext::reproducible();
+        let state = steady_point(&fixture);
+        let rate = vec![0.0; fixture.dimension()];
+        for rate_shift in [0.0, 1.0] {
+            let via_new = DaeOperator::jacobian_diagonal(
+                &fixture.operator,
+                &context,
+                0.0,
+                &state,
+                &rate,
+                rate_shift,
+            )
+            .unwrap()
+            .expect("the `new` path admits a connected diagonal");
+            let via_system_diagonal = DaeOperator::jacobian_diagonal(
+                &via_system,
+                &context,
+                0.0,
+                &state,
+                &rate,
+                rate_shift,
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("{label}: the new_system path returned no diagonal"));
+            assert_eq!(
+                via_new, via_system_diagonal,
+                "{label}: both constructors reach the same Finitum call bit-for-bit"
+            );
+        }
+    }
+}
+
+#[test]
 fn matching_connected_diagonal_is_finitums_and_equals_the_sum_of_leaf_convention() {
     let fixture = steady_fixture(MATCHING, [2.5, 3.0], DIRICHLET);
     assert!(fixture.operator.has_connected_diagonal());

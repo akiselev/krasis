@@ -23,7 +23,9 @@
 //! norm (l2 ≥ sup, so a converged iteration also meets the former test). The committed state is
 //! the terminal sweep's raw output `G(x_k)` (one full schedule sweep from the iterate Methodus
 //! judged converged, so every block is Newton-solved against the others' values), which for
-//! `FixedRelaxation { factor: 1.0 }` is exactly the pre-W10 plain iteration's result.
+//! `FixedRelaxation { factor: 1.0 }` reproduces the pre-W10 plain iteration (Methodus applies
+//! `x + 1.0 · (G(x) − x)`, equal to `G(x)` whenever that difference is exact; bit-for-bit on the
+//! suite's fixtures, a rounding-level difference is possible in general).
 //!
 //! `NewtonConfig::acceleration` (Methodus's per-call relaxation of the partitioned Newton
 //! correction) stays refused by [`PartitionedConfig`]: forwarded into every per-sweep

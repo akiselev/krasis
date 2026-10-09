@@ -125,6 +125,9 @@ impl ConnectedSystemOperator {
                     _ => None,
                 };
                 endpoints.and_then(|endpoints| {
+                    // `system_constraints` has already formed `constraints(endpoints)` on this
+                    // same pair, so a refusal here is unreachable in practice; were it reached,
+                    // the operator falls back to the sum-of-leaf convention rather than refuse.
                     let own = plan.constraints(endpoints).ok()?;
                     let split = endpoints[0].operator().dimension();
                     let offset = inner.leaf_range(leaves[0]).expect("leaf index").start;
