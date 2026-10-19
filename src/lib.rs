@@ -11,6 +11,7 @@ mod coupled;
 mod coupled_system;
 mod error;
 mod event;
+mod explicit;
 mod initial;
 mod layout;
 mod partitioned;
@@ -35,6 +36,11 @@ pub use coupled_system::{
 };
 pub use error::KrasisError;
 pub use event::{EventDirection, EventRecord};
+pub use explicit::{
+    EXPLICIT_CONFIG_IDENTITY_SCHEMA, ExplicitCheckpoint, ExplicitConservationSummary,
+    ExplicitExecution, ExplicitRefusedAttempt, ExplicitRejectionRecord, ExplicitStepRecord,
+    InvariantBalanceCheck, explicit_config_identity,
+};
 pub use initial::{NodalContext, initial_state_from};
 pub use layout::{BlockId, StateBlock, StateLayout};
 pub use partitioned::{

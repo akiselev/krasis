@@ -101,6 +101,39 @@ pub enum KrasisError {
         "consistent-initialization mask has {actual} rows, expected {expected} to match the operator dimension"
     )]
     ConsistentInitializationMaskLength { actual: usize, expected: usize },
+    /// An explicit initial state outside the operator's admissible set (Methodus
+    /// `SolveError::InadmissibleState`).
+    #[error("inadmissible explicit initial state: {reason}")]
+    InadmissibleExplicitState {
+        index: Option<usize>,
+        reason: String,
+    },
+    /// An explicit step size fell below the step policy's minimum (Methodus
+    /// `SolveError::StepSizeCollapse`); the attempt was rolled back.
+    #[error("explicit step {step} at time {time} is below the minimum step {minimum_step}")]
+    ExplicitStepCollapse {
+        time: f64,
+        step: f64,
+        minimum_step: f64,
+    },
+    /// A rejected explicit attempt with no suggested step (`StepPolicy::Fixed` never shrinks its
+    /// step); the attempt was rolled back.
+    #[error("explicit step from time {time} rejected without a suggested step: {rejection}")]
+    ExplicitStepRejected {
+        time: f64,
+        rejection: methodus::ExplicitRejection,
+    },
+    /// One explicit step used its whole attempt budget on rejected attempts; every attempt was
+    /// rolled back.
+    #[error("explicit step from time {time} was rejected on all {attempts} attempts of its budget")]
+    ExplicitAttemptBudgetExhausted { time: f64, attempts: usize },
+    /// A checkpoint bound to a different identity than the execution restoring it.
+    #[error("checkpoint {what} identity `{actual}` does not match `{expected}`")]
+    CheckpointIdentityMismatch {
+        what: String,
+        expected: String,
+        actual: String,
+    },
     /// A typed evaluation failure (W8 decision 3) that reached a Krasis transaction or
     /// initialization: the producer's own refusal code and origin, carried verbatim from
     /// Finitum's `InputEvaluationError` through Methodus's `NumericError::Evaluation`. The
