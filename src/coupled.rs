@@ -8,8 +8,10 @@ use methodus::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::partitioned::CapturingPartitionedFixedPoint;
 use crate::{
-    BlockId, Checkpoint, KrasisError, SimulationState, StateBinding, StateLayout, TransactionPhase,
+    BlockId, Checkpoint, KrasisError, PartitionedConfig, PartitionedStepReport, SimulationState,
+    StateBinding, StateLayout, TransactionPhase,
 };
 
 /// Per-row classification for index-1 consistent initialization.
@@ -748,6 +750,35 @@ pub struct RefusedAttempt {
     pub step: f64,
 }
 
+/// Schema tag of [`CoupledStepRecord`].
+pub const COUPLED_STEP_RECORD_SCHEMA: &str = "krasis-coupled-step/1";
+
+/// Telemetry of one committed BDF step of a [`CoupledExecution`] (W13): the step's times and
+/// Methodus's error estimate and suggested next step, plus, when the step's nonlinear solve was
+/// the partitioned fixed point driven through [`CoupledExecution::attempt_step_partitioned`],
+/// its [`PartitionedStepReport`]. `partitioned` is skipped when absent, so a monolithic step
+/// (`attempt_step`, or any solver through `attempt_step_with`) serializes without the key.
+/// Records live in memory with the execution, like [`CoupledExecution::evaluation_refusals`]:
+/// they are not part of [`CoupledCheckpoint`] (whose bytes are unchanged), and
+/// [`CoupledExecution::restore`] drops the records past the restored step.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CoupledStepRecord {
+    /// [`COUPLED_STEP_RECORD_SCHEMA`].
+    pub schema: String,
+    /// The committed step count after this step (`1` for the first step).
+    pub accepted_step: u64,
+    pub start_time: f64,
+    pub end_time: f64,
+    /// The attempted (and, for an accepted step, taken) step size.
+    pub step: f64,
+    /// Methodus's local error estimate of the accepted step.
+    pub error_estimate: f64,
+    /// Methodus's suggested next step.
+    pub suggested_step: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitioned: Option<PartitionedStepReport>,
+}
+
 impl TransactionalOperator for CoupledOperator {
     fn identity(&self) -> &str {
         &self.identity
@@ -771,6 +802,7 @@ pub struct CoupledExecution<Op: TransactionalOperator = CoupledOperator> {
     state: SimulationState,
     integrator: BdfState,
     refusals: Vec<RefusedAttempt>,
+    steps: Vec<CoupledStepRecord>,
 }
 
 impl<Op: TransactionalOperator> CoupledExecution<Op> {
@@ -804,6 +836,7 @@ impl<Op: TransactionalOperator> CoupledExecution<Op> {
             state,
             integrator,
             refusals: Vec::new(),
+            steps: Vec::new(),
         };
         execution.validate_synchronized()?;
         Ok(execution)
@@ -815,6 +848,14 @@ impl<Op: TransactionalOperator> CoupledExecution<Op> {
     /// until one occurs; not part of the checkpoint.
     pub fn evaluation_refusals(&self) -> &[RefusedAttempt] {
         &self.refusals
+    }
+
+    /// Per-step telemetry of the committed trajectory, in step order: one
+    /// [`CoupledStepRecord`] per accepted step, carrying the partitioned evidence of the steps
+    /// driven through [`Self::attempt_step_partitioned`]. Not part of the checkpoint; records
+    /// past a restored step are dropped by [`Self::restore`].
+    pub fn step_records(&self) -> &[CoupledStepRecord] {
+        &self.steps
     }
 
     pub fn operator(&self) -> &Op {
@@ -868,17 +909,55 @@ impl<Op: TransactionalOperator> CoupledExecution<Op> {
         })
     }
 
+    /// [`Self::attempt_step_with`] over the partitioned fixed point
+    /// ([`crate::PartitionedFixedPoint`] semantics: `layout` is the solver block layout the
+    /// schedule sweeps, `partitioned` its configuration; a refusal surfaces as
+    /// [`KrasisError::EvaluationRefused`] with the partitioned code and origin after rollback),
+    /// which additionally records the run's [`PartitionedStepReport`] on the committed step's
+    /// [`CoupledStepRecord`]: sweeps, residual histories, acceleration kind, per-sweep cost and
+    /// the full report. The accepted state is bit for bit the one `attempt_step_with` commits
+    /// with a `PartitionedFixedPoint` over the same layout and configuration.
+    pub fn attempt_step_partitioned(
+        &mut self,
+        context: &EvaluationContext,
+        step: f64,
+        config: &BdfConfig,
+        layout: &SolverBlockLayout,
+        partitioned: &PartitionedConfig,
+    ) -> Result<StepOutcome, KrasisError> {
+        let solver = CapturingPartitionedFixedPoint::new(layout, partitioned);
+        let outcome = self.transact_step(step, |operator, integrator| {
+            bdf_step_with(operator, context, integrator, step, config, &solver)
+        })?;
+        if let StepOutcome::Accepted(_) = &outcome {
+            let report = solver.take_report().ok_or_else(|| {
+                KrasisError::InvalidCoupling(
+                    "the accepted BDF step did not run the partitioned fixed point".into(),
+                )
+            })?;
+            let record = self
+                .steps
+                .last_mut()
+                .expect("an accepted step was just recorded");
+            record.partitioned = Some(PartitionedStepReport::from_report(report));
+        }
+        Ok(outcome)
+    }
+
     /// One BDF attempt enclosed in `begin_trial` / `commit` / `rollback`: an accepted step
-    /// commits the new values at the step's time; a rejected step or a solver error rolls the
-    /// trial back and leaves the committed state and the BDF history untouched. A typed
-    /// evaluation failure is rolled back the same way, logged, and returned as
-    /// [`KrasisError::EvaluationRefused`] with the producer's code and origin.
+    /// commits the new values at the step's time and appends its [`CoupledStepRecord`]; a
+    /// rejected step or a solver error rolls the trial back and leaves the committed state, the
+    /// BDF history and the records untouched. A typed evaluation failure is rolled back the same
+    /// way, logged, and returned as [`KrasisError::EvaluationRefused`] with the producer's code
+    /// and origin.
     fn transact_step(
         &mut self,
         step: f64,
         attempt: impl FnOnce(&Op, &BdfState) -> Result<StepOutcome, SolveError>,
     ) -> Result<StepOutcome, KrasisError> {
         self.validate_synchronized()?;
+        let start_time = self.integrator.time;
+        let accepted_step = self.integrator.accepted_steps + 1;
         self.state.begin_trial()?;
         let outcome = match attempt(&self.operator, &self.integrator) {
             Ok(outcome) => outcome,
@@ -915,6 +994,16 @@ impl<Op: TransactionalOperator> CoupledExecution<Op> {
                     return Err(error);
                 }
                 self.integrator = accepted.state.clone();
+                self.steps.push(CoupledStepRecord {
+                    schema: COUPLED_STEP_RECORD_SCHEMA.to_owned(),
+                    accepted_step,
+                    start_time,
+                    end_time: accepted.state.time,
+                    step,
+                    error_estimate: accepted.error_estimate,
+                    suggested_step: accepted.suggested_step,
+                    partitioned: None,
+                });
             }
             StepOutcome::Rejected(_) => self.state.rollback()?,
         }
@@ -932,6 +1021,8 @@ impl<Op: TransactionalOperator> CoupledExecution<Op> {
     }
 
     /// Atomically restore transactional state and BDF history after validating their identity.
+    /// Step records past the restored step are dropped, so [`Self::step_records`] describes the
+    /// restored trajectory; the evaluation-refusal log is left alone.
     pub fn restore(&mut self, checkpoint: &CoupledCheckpoint) -> Result<(), KrasisError> {
         if checkpoint.operator_identity != self.operator.identity() {
             return Err(KrasisError::InvalidCoupling(format!(
@@ -949,6 +1040,8 @@ impl<Op: TransactionalOperator> CoupledExecution<Op> {
         )?;
         self.state = candidate;
         self.integrator = checkpoint.integrator.clone();
+        let step = self.integrator.accepted_steps;
+        self.steps.retain(|record| record.accepted_step <= step);
         Ok(())
     }
 

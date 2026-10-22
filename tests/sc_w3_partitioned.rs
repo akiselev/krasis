@@ -21,11 +21,13 @@ use finitum::{
     RealizationPlan, VertexId,
 };
 use krasis::{
-    BlockId, CoupledExecution, CoupledLeaf, CoupledOperator, CoupledSystemOperator,
-    CouplingArgument, CouplingEdge, FieldId, KrasisError, PARTITIONED_DIVERGED,
-    PARTITIONED_MAX_SWEEPS, PARTITIONED_REFUSAL_ORIGIN, PartitionedConfig, PartitionedDisposition,
+    BlockId, COUPLED_STEP_RECORD_SCHEMA, CoupledExecution, CoupledLeaf, CoupledOperator,
+    CoupledStepRecord, CoupledSystemOperator, CouplingArgument, CouplingEdge, FieldId, KrasisError,
+    PARTITIONED_DIVERGED, PARTITIONED_MAX_SWEEPS, PARTITIONED_REFUSAL_ORIGIN,
+    PARTITIONED_STEP_REPORT_SCHEMA, PartitionedConfig, PartitionedDisposition,
     PartitionedExecution, PartitionedFixedPoint, PartitionedIteration, PartitionedSchedule,
-    RowKind, SemanticId, SimulationState, StateBinding, StateBlock, StateLayout, run_partitioned,
+    RowKind, SemanticId, SimulationState, StateBinding, StateBlock, StateLayout, SweepCost,
+    run_partitioned,
 };
 use methodus::{
     AccelerationMethod, BdfConfig, BdfOrder, BlockLayout, BlockNonlinearOperator, BlockSpec,
@@ -1233,5 +1235,237 @@ fn aitken_converges_in_fewer_sweeps_than_plain_iteration_on_a_slowly_contracting
         "Aitken took {} sweeps, plain iteration {}",
         counts[1],
         counts[0]
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// W13 package 2: per-step partitioned evidence inside BDF (`CoupledStepRecord::partitioned`)
+// -------------------------------------------------------------------------------------------
+
+/// The exact bytes a step record without partitioned evidence serializes to: the W13 schema,
+/// the step's times and Methodus's two numbers, and no `partitioned` key.
+fn monolithic_record_bytes(record: &CoupledStepRecord) -> String {
+    let number = |value: f64| serde_json::to_string(&value).unwrap();
+    format!(
+        r#"{{"schema":"{}","accepted_step":{},"start_time":{},"end_time":{},"step":{},"error_estimate":{},"suggested_step":{}}}"#,
+        COUPLED_STEP_RECORD_SCHEMA,
+        record.accepted_step,
+        number(record.start_time),
+        number(record.end_time),
+        number(record.step),
+        number(record.error_estimate),
+        number(record.suggested_step),
+    )
+}
+
+#[test]
+fn each_committed_partitioned_bdf_step_carries_a_report_whose_sweeps_match_the_trace() {
+    let operator = two_block_network(0.4);
+    let context = EvaluationContext::reproducible();
+    let step = 0.05;
+    let steps = 6;
+    let config = fixed_step_config(BdfOrder::Two, step);
+    let layout = BlockNonlinearOperator::block_layout(&operator).clone();
+    let partitioned_config = implicit_config(PartitionedSchedule::Serial, 1.0e-12, 100);
+
+    let mut recorded = CoupledExecution::new(
+        operator.clone(),
+        network_initial_state(&operator, 1.0, 0.0),
+        &context,
+    )
+    .unwrap();
+    let solver = PartitionedFixedPoint::new(&layout, &partitioned_config);
+    let mut plugged = CoupledExecution::new(
+        operator.clone(),
+        network_initial_state(&operator, 1.0, 0.0),
+        &context,
+    )
+    .unwrap();
+    assert!(recorded.step_records().is_empty());
+
+    for n in 1..=steps {
+        let previous_time = recorded.state().time();
+        let outcome = recorded
+            .attempt_step_partitioned(&context, step, &config, &layout, &partitioned_config)
+            .unwrap();
+        assert!(matches!(outcome, StepOutcome::Accepted(_)));
+        let plugged_outcome = plugged
+            .attempt_step_with(&context, step, &config, &solver)
+            .unwrap();
+        assert!(matches!(plugged_outcome, StepOutcome::Accepted(_)));
+        // The recording path makes exactly the plugged-in solve: bitwise the same committed state.
+        assert_eq!(
+            recorded.state().committed_vector().unwrap(),
+            plugged.state().committed_vector().unwrap()
+        );
+
+        assert_eq!(recorded.step_records().len(), n);
+        let record = recorded.step_records().last().unwrap();
+        assert_eq!(record.schema, COUPLED_STEP_RECORD_SCHEMA);
+        assert_eq!(record.accepted_step, n as u64);
+        assert_eq!(record.start_time, previous_time);
+        assert_eq!(record.end_time, recorded.state().time());
+        assert_eq!(record.step, step);
+        assert!(record.error_estimate.is_finite() && record.suggested_step > 0.0);
+
+        let evidence = record
+            .partitioned
+            .as_ref()
+            .expect("a partitioned step carries its evidence");
+        assert_eq!(evidence.schema, PARTITIONED_STEP_REPORT_SCHEMA);
+        assert_eq!(evidence.schedule, PartitionedSchedule::Serial);
+        assert_eq!(evidence.disposition, PartitionedDisposition::Converged);
+        assert_eq!(
+            evidence.acceleration,
+            Some(AccelerationMethod::FixedRelaxation { factor: 1.0 })
+        );
+        // Sweep count: the summary, the verbatim report and Methodus's acceleration trace agree
+        // (one trace entry per sweep), and an implicit iteration took at least two sweeps.
+        let report = &evidence.report;
+        assert_eq!(evidence.sweeps, report.sweeps.len());
+        assert_eq!(
+            evidence.sweeps,
+            report.acceleration.as_ref().unwrap().trace.len()
+        );
+        assert!(evidence.sweeps >= 2, "{} sweeps", evidence.sweeps);
+        assert_eq!(
+            evidence.residual_history,
+            report
+                .sweeps
+                .iter()
+                .map(|sweep| sweep.post_sweep_residual_norm)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            evidence.state_change_history,
+            report
+                .sweeps
+                .iter()
+                .map(|sweep| sweep.state_change_norm)
+                .collect::<Vec<_>>()
+        );
+        // The last sweep met the declared tolerance (the fixed-point residual Methodus tests).
+        assert!(*evidence.state_change_history.last().unwrap() <= 1.0e-12 * 10.0);
+        // Per-sweep cost: one block-Newton update over both blocks per sweep.
+        assert_eq!(
+            evidence.sweep_costs,
+            (1..=evidence.sweeps)
+                .map(|sweep| SweepCost {
+                    sweep,
+                    blocks: 2,
+                    newton_updates: 1,
+                    block_updates: 2,
+                })
+                .collect::<Vec<_>>()
+        );
+
+        // The generic `NonlinearSolver` path records the step without evidence.
+        let plugged_record = plugged.step_records().last().unwrap();
+        assert!(plugged_record.partitioned.is_none());
+        let mut stripped = record.clone();
+        stripped.partitioned = None;
+        assert_eq!(&stripped, plugged_record);
+
+        // Serde round trip of the evidence-bearing record.
+        let json = serde_json::to_string(record).unwrap();
+        assert!(json.contains(r#""partitioned":{"schema":"krasis-partitioned-step/1""#));
+        let decoded: CoupledStepRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(&decoded, record);
+    }
+    assert!(recorded.evaluation_refusals().is_empty());
+
+    // A refused partitioned step (the sweep budget runs out) commits nothing and records
+    // nothing: the records are those of the six committed steps, the refusal is logged.
+    let starved = implicit_config(PartitionedSchedule::Serial, 1.0e-300, 2);
+    let error = recorded
+        .attempt_step_partitioned(&context, step, &config, &layout, &starved)
+        .unwrap_err();
+    match error {
+        KrasisError::EvaluationRefused { code, origin, .. } => {
+            assert_eq!(code, PARTITIONED_MAX_SWEEPS);
+            assert_eq!(origin, PARTITIONED_REFUSAL_ORIGIN);
+        }
+        other => panic!("unexpected error {other:?}"),
+    }
+    assert_eq!(recorded.step_records().len(), steps);
+    assert_eq!(recorded.evaluation_refusals().len(), 1);
+    assert_eq!(recorded.state().step(), steps as u64);
+
+    // Records are telemetry, not checkpoint content: restoring the step-3 checkpoint drops the
+    // records past it, and the checkpoint itself carries no record key.
+    let checkpoint = {
+        let mut replay = CoupledExecution::new(
+            operator.clone(),
+            network_initial_state(&operator, 1.0, 0.0),
+            &context,
+        )
+        .unwrap();
+        for _ in 0..3 {
+            replay
+                .attempt_step_partitioned(&context, step, &config, &layout, &partitioned_config)
+                .unwrap();
+        }
+        replay.checkpoint().unwrap()
+    };
+    // (`serde_json::Value` orders keys alphabetically.)
+    let checkpoint_json: serde_json::Value = serde_json::to_value(&checkpoint).unwrap();
+    assert_eq!(
+        checkpoint_json
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["integrator", "operator_identity", "state"]
+    );
+    recorded.restore(&checkpoint).unwrap();
+    assert_eq!(recorded.step_records().len(), 3);
+    assert_eq!(recorded.step_records()[2].accepted_step, 3);
+    assert_eq!(recorded.evaluation_refusals().len(), 1);
+}
+
+#[test]
+fn a_monolithic_step_record_serializes_without_the_partitioned_key_byte_for_byte() {
+    let operator = two_block_network(0.4);
+    let context = EvaluationContext::reproducible();
+    let step = 0.05;
+    let config = fixed_step_config(BdfOrder::Two, step);
+    let mut dense = CoupledExecution::new(
+        operator.clone(),
+        network_initial_state(&operator, 1.0, 0.0),
+        &context,
+    )
+    .unwrap();
+    let before = serde_json::to_vec(&dense.checkpoint().unwrap()).unwrap();
+    for n in 1..=4u64 {
+        let outcome = dense.attempt_step(&context, step, &config).unwrap();
+        assert!(matches!(outcome, StepOutcome::Accepted(_)));
+        let record = &dense.step_records()[n as usize - 1];
+        assert_eq!(record.accepted_step, n);
+        assert!(record.partitioned.is_none());
+        let json = serde_json::to_string(record).unwrap();
+        assert_eq!(json, monolithic_record_bytes(record));
+        assert!(!json.contains("partitioned"));
+        let decoded: CoupledStepRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(&decoded, record);
+    }
+    // The checkpoint shape is the W10 one: the same three keys before and after stepping, no
+    // record content.
+    let after = dense.checkpoint().unwrap();
+    let keys = |bytes: &[u8]| {
+        serde_json::from_slice::<serde_json::Value>(bytes)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    // (`serde_json::Value` orders keys alphabetically.)
+    assert_eq!(keys(&before), ["integrator", "operator_identity", "state"]);
+    assert_eq!(keys(&serde_json::to_vec(&after).unwrap()), keys(&before));
+    assert!(
+        serde_json::to_string(&after)
+            .unwrap()
+            .starts_with(r#"{"operator_identity":"#)
     );
 }

@@ -280,6 +280,93 @@ pub struct PartitionedSolve {
     pub report: PartitionedReport,
 }
 
+/// Schema tag of [`PartitionedStepReport`].
+pub const PARTITIONED_STEP_REPORT_SCHEMA: &str = "krasis-partitioned-step/1";
+
+/// The work one sweep of a partitioned decomposition did, counted from its block-Newton trace:
+/// Methodus's `solve_blocks(.., max_iterations = 1, ..)` records one entry before and one after
+/// each update, so `newton_updates` is the trace length less one (`1` for every accepted sweep
+/// today) and `block_updates` is that times the number of blocks the schedule visited.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SweepCost {
+    /// `1`-based sweep index, matching [`SweepReport::sweep`].
+    pub sweep: usize,
+    /// Blocks the schedule visited in this sweep (`BlockLayout` blocks).
+    pub blocks: usize,
+    /// Block-Newton updates over the whole schedule in this sweep.
+    pub newton_updates: usize,
+    /// Block solves in this sweep: `newton_updates × blocks`.
+    pub block_updates: usize,
+}
+
+/// Per-step partitioned evidence of one committed BDF step
+/// ([`crate::CoupledStepRecord::partitioned`], W10 request): the run's schedule, acceleration
+/// kind and disposition, the sweep count, the residual histories and the per-sweep cost as flat
+/// summaries, and the full [`PartitionedReport`] (every sweep's block-Newton trace and the
+/// Methodus acceleration trace) verbatim. `schema` is [`PARTITIONED_STEP_REPORT_SCHEMA`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PartitionedStepReport {
+    pub schema: String,
+    pub schedule: PartitionedSchedule,
+    pub disposition: PartitionedDisposition,
+    /// The declared acceleration kind; `None` for `Once` (no fixed-point driver ran).
+    pub acceleration: Option<AccelerationMethod>,
+    /// Number of sweeps the step took, `report.sweeps.len()`.
+    pub sweeps: usize,
+    /// The monolithic residual l2 norm after each sweep ([`SweepReport::post_sweep_residual_norm`]),
+    /// in sweep order.
+    pub residual_history: Vec<f64>,
+    /// `‖G(x) − x‖∞` of each sweep ([`SweepReport::state_change_norm`]), in sweep order: the
+    /// fixed-point residual Krasis's divergence observations evaluate.
+    pub state_change_history: Vec<f64>,
+    /// One entry per sweep, in sweep order.
+    pub sweep_costs: Vec<SweepCost>,
+    pub report: PartitionedReport,
+}
+
+impl PartitionedStepReport {
+    /// Summarizes an accepted run's report; the report itself is kept verbatim.
+    #[must_use]
+    pub fn from_report(report: PartitionedReport) -> Self {
+        let sweep_costs = report
+            .sweeps
+            .iter()
+            .map(|sweep| {
+                let blocks = sweep.block_residual_norms.len();
+                let newton_updates = sweep.newton_trace.len().saturating_sub(1);
+                SweepCost {
+                    sweep: sweep.sweep,
+                    blocks,
+                    newton_updates,
+                    block_updates: newton_updates * blocks,
+                }
+            })
+            .collect();
+        Self {
+            schema: PARTITIONED_STEP_REPORT_SCHEMA.to_owned(),
+            schedule: report.schedule,
+            disposition: report.disposition,
+            acceleration: report
+                .acceleration
+                .as_ref()
+                .map(|acceleration| acceleration.method),
+            sweeps: report.sweeps.len(),
+            residual_history: report
+                .sweeps
+                .iter()
+                .map(|sweep| sweep.post_sweep_residual_norm)
+                .collect(),
+            state_change_history: report
+                .sweeps
+                .iter()
+                .map(|sweep| sweep.state_change_norm)
+                .collect(),
+            sweep_costs,
+            report,
+        }
+    }
+}
+
 fn typed_numeric(code: &str, message: String) -> NumericError {
     NumericError::Evaluation {
         code: code.to_owned(),
@@ -678,7 +765,9 @@ impl BlockNonlinearOperator for LayoutView<'_> {
 /// generic shape `BlockNewton` and `NewtonKrylovSolver` report through today. `solve` returns
 /// every sweep's own Methodus block-Newton trace concatenated in `SolveReport::trace`, so the
 /// per-sweep residual evidence survives; the state-change norms, schedule and acceleration
-/// trace do not (see `STATUS.md`).
+/// trace do not. A step that needs them is driven through
+/// [`crate::CoupledExecution::attempt_step_partitioned`], which records a
+/// [`PartitionedStepReport`] on the committed step (W13).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PartitionedFixedPoint<'a> {
     layout: &'a BlockLayout,
@@ -699,22 +788,86 @@ impl NonlinearSolver for PartitionedFixedPoint<'_> {
         context: &EvaluationContext,
         initial_state: &[f64],
     ) -> Result<SolveReport, SolveError> {
-        let view = LayoutView {
-            inner: operator,
-            layout: self.layout,
-        };
-        let solved = run_partitioned(&view, context, initial_state, self.config)?;
-        let trace = solved
-            .report
-            .sweeps
-            .into_iter()
-            .flat_map(|sweep| sweep.newton_trace)
-            .collect();
-        Ok(SolveReport {
-            state: solved.state,
-            converged: true,
-            trace,
-        })
+        let solved = solve_over_layout(self.layout, self.config, operator, context, initial_state)?;
+        Ok(solve_report(solved.state, solved.report))
+    }
+}
+
+/// [`run_partitioned`] over a Methodus `NonlinearOperator` viewed through `layout`: the one
+/// call both [`PartitionedFixedPoint`] and [`CapturingPartitionedFixedPoint`] make.
+fn solve_over_layout(
+    layout: &BlockLayout,
+    config: &PartitionedConfig,
+    operator: &dyn NonlinearOperator,
+    context: &EvaluationContext,
+    initial_state: &[f64],
+) -> Result<PartitionedSolve, SolveError> {
+    let view = LayoutView {
+        inner: operator,
+        layout,
+    };
+    run_partitioned(&view, context, initial_state, config)
+}
+
+/// The generic `SolveReport` of an accepted partitioned solve: every sweep's block-Newton trace
+/// concatenated, `converged` by acceptance (see [`PartitionedFixedPoint`]).
+fn solve_report(state: Vec<f64>, report: PartitionedReport) -> SolveReport {
+    let trace = report
+        .sweeps
+        .into_iter()
+        .flat_map(|sweep| sweep.newton_trace)
+        .collect();
+    SolveReport {
+        state,
+        converged: true,
+        trace,
+    }
+}
+
+/// [`PartitionedFixedPoint`] that also keeps the [`PartitionedReport`] of its latest accepted
+/// solve, so [`crate::CoupledExecution::attempt_step_partitioned`] can attach it to the step it
+/// commits (`methodus::NonlinearSolver::solve` itself returns only the generic `SolveReport`).
+/// The solve is bit for bit the one [`PartitionedFixedPoint`] makes.
+#[derive(Debug)]
+pub(crate) struct CapturingPartitionedFixedPoint<'a> {
+    layout: &'a BlockLayout,
+    config: &'a PartitionedConfig,
+    captured: Mutex<Option<PartitionedReport>>,
+}
+
+impl<'a> CapturingPartitionedFixedPoint<'a> {
+    pub(crate) const fn new(layout: &'a BlockLayout, config: &'a PartitionedConfig) -> Self {
+        Self {
+            layout,
+            config,
+            captured: Mutex::new(None),
+        }
+    }
+
+    /// The report of the latest accepted solve, taken out (a refused solve leaves `None`).
+    pub(crate) fn take_report(&self) -> Option<PartitionedReport> {
+        self.captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+impl NonlinearSolver for CapturingPartitionedFixedPoint<'_> {
+    fn solve(
+        &self,
+        operator: &dyn NonlinearOperator,
+        context: &EvaluationContext,
+        initial_state: &[f64],
+    ) -> Result<SolveReport, SolveError> {
+        let mut captured = self
+            .captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *captured = None;
+        let solved = solve_over_layout(self.layout, self.config, operator, context, initial_state)?;
+        *captured = Some(solved.report.clone());
+        Ok(solve_report(solved.state, solved.report))
     }
 }
 

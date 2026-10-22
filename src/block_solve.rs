@@ -18,7 +18,10 @@
 //! also carries a Krasis [`OperatorIdentity`]; the Finitum block operators Krasis composes
 //! (`MixedOperator`, `SystemOperator`, `ReducedSystemOperator`) implement it from their own
 //! content digests, so a [`BlockLinearCheckpoint`] binds to the operator's numerical content and
-//! not only to its shape.
+//! not only to its shape. Finitum's finite-volume realization (`FvRealization`, an
+//! `ExplicitOperator`/`DaeOperator` rather than a block linear operator) carries the same trait
+//! from its `finitum-fv-realization/1` digest, so [`crate::ExplicitExecution`] binds its
+//! checkpoints to it directly.
 
 use serde::{Deserialize, Serialize};
 
@@ -35,11 +38,22 @@ use crate::{Checkpoint, KrasisError, SimulationState, TransactionPhase};
 ///
 /// Two operators with the same shape (dimension, block layout, declared properties) but a
 /// different action -- a different mesh, coefficient, coupling scale, or constraint set -- must
-/// report different identities. Finitum's block operators implement this from their own content
+/// report different identities. Finitum's operators implement this from their own content
 /// digests (`finitum::MixedOperator::digest`, `finitum::SystemOperator::digest`, plus the
-/// serialized `ConstraintSet` for the reduced operator).
+/// serialized `ConstraintSet` for the reduced operator, and `finitum::FvRealization::digest`
+/// for the finite-volume realization).
 pub trait OperatorIdentity {
     fn content_identity(&self) -> String;
+}
+
+/// `finitum-fv:<algorithm>:<hex>` over Finitum's `finitum-fv-realization/1` digest (program,
+/// topology, data values and boundary binding), mirroring the mixed/system impls, so a
+/// finite-volume explicit or BDF transaction checkpoint binds to the realization's numerical
+/// content without a consumer-side newtype.
+impl OperatorIdentity for finitum::FvRealization {
+    fn content_identity(&self) -> String {
+        format!("finitum-fv:{}", self.digest())
+    }
 }
 
 impl OperatorIdentity for finitum::MixedOperator {

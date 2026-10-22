@@ -27,8 +27,9 @@ pub use block_solve::{
 };
 pub use checkpoint::Checkpoint;
 pub use coupled::{
-    CoupledCheckpoint, CoupledExecution, CoupledOperator, EvaluationRefusal, FinitumRealization,
-    RefusedAttempt, RowKind, TransactionalOperator,
+    COUPLED_STEP_RECORD_SCHEMA, CoupledCheckpoint, CoupledExecution, CoupledOperator,
+    CoupledStepRecord, EvaluationRefusal, FinitumRealization, RefusedAttempt, RowKind,
+    TransactionalOperator,
 };
 pub use coupled_system::{
     CoupledLeaf, CoupledSystemOperator, CouplingArgument, CouplingDependency, CouplingEdge,
@@ -39,15 +40,17 @@ pub use event::{EventDirection, EventRecord};
 pub use explicit::{
     EXPLICIT_CONFIG_IDENTITY_SCHEMA, ExplicitCheckpoint, ExplicitConservationSummary,
     ExplicitExecution, ExplicitRefusedAttempt, ExplicitRejectionRecord, ExplicitStepRecord,
-    InvariantBalanceCheck, explicit_config_identity,
+    INVARIANT_LABEL_SCHEMA, InvariantBalanceCheck, InvariantConservationSummary, InvariantLabel,
+    explicit_config_identity,
 };
 pub use initial::{NodalContext, initial_state_from};
 pub use layout::{BlockId, StateBlock, StateLayout};
 pub use partitioned::{
     PARTITIONED_ACCELERATION_BREAKDOWN, PARTITIONED_DIVERGED, PARTITIONED_MAX_SWEEPS,
-    PARTITIONED_REFUSAL_ORIGIN, PartitionedAcceleration, PartitionedCheckpoint, PartitionedConfig,
-    PartitionedDisposition, PartitionedExecution, PartitionedFixedPoint, PartitionedIteration,
-    PartitionedReport, PartitionedSchedule, PartitionedSolve, SweepReport, run_partitioned,
+    PARTITIONED_REFUSAL_ORIGIN, PARTITIONED_STEP_REPORT_SCHEMA, PartitionedAcceleration,
+    PartitionedCheckpoint, PartitionedConfig, PartitionedDisposition, PartitionedExecution,
+    PartitionedFixedPoint, PartitionedIteration, PartitionedReport, PartitionedSchedule,
+    PartitionedSolve, PartitionedStepReport, SweepCost, SweepReport, run_partitioned,
 };
 pub use state::{ConstitutiveSlot, FieldId, SimulationState, TransactionPhase};
 pub use verification::{

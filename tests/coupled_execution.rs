@@ -599,3 +599,59 @@ fn square_discretization(subdivisions: usize, center_shift: f64) -> (Mesh, DofMa
     .unwrap();
     (mesh, dofs, constraints)
 }
+
+#[test]
+fn step_records_follow_accepted_steps_only_and_are_dropped_past_a_restored_step() {
+    let context = EvaluationContext::reproducible();
+    let (operator, state) = coupled_fixture();
+    let mut execution = CoupledExecution::new(operator.clone(), state, &context).unwrap();
+    let fixed = fixed_config(0.05);
+    assert!(execution.step_records().is_empty());
+
+    let first = execution.attempt_step(&context, 0.05, &fixed).unwrap();
+    assert!(matches!(first, StepOutcome::Accepted(_)));
+    assert_eq!(execution.step_records().len(), 1);
+    let record = &execution.step_records()[0];
+    assert_eq!(record.schema, krasis::COUPLED_STEP_RECORD_SCHEMA);
+    assert_eq!(record.accepted_step, 1);
+    assert_eq!(record.start_time, 0.0);
+    assert_eq!(record.end_time, 0.05);
+    assert_eq!(record.step, 0.05);
+    assert!(record.partitioned.is_none());
+    assert!(
+        !serde_json::to_string(record)
+            .unwrap()
+            .contains("partitioned")
+    );
+
+    // A rejected step records nothing.
+    let strict = BdfConfig {
+        order: BdfOrder::Two,
+        absolute_tolerance: 1.0e-16,
+        relative_tolerance: 1.0e-16,
+        minimum_step: 1.0e-8,
+        maximum_step: 0.05,
+        ..BdfConfig::default()
+    };
+    let rejected = execution.attempt_step(&context, 0.05, &strict).unwrap();
+    assert!(matches!(rejected, StepOutcome::Rejected(_)));
+    assert_eq!(execution.step_records().len(), 1);
+
+    let checkpoint = execution.checkpoint().unwrap();
+    for _ in 0..2 {
+        let outcome = execution.attempt_step(&context, 0.05, &fixed).unwrap();
+        assert!(matches!(outcome, StepOutcome::Accepted(_)));
+    }
+    assert_eq!(execution.step_records().len(), 3);
+    assert_eq!(
+        execution
+            .step_records()
+            .iter()
+            .map(|record| record.accepted_step)
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    execution.restore(&checkpoint).unwrap();
+    assert_eq!(execution.step_records().len(), 1);
+    assert_eq!(execution.step_records()[0].accepted_step, 1);
+}

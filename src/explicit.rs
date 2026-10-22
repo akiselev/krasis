@@ -24,7 +24,11 @@
 //! four per stage of stage arithmetic, the budget Methodus's own conservation proof uses). This is
 //! arithmetic on the reported numbers only; Krasis computes no physics and names no mesh, and
 //! Sinbad maps [`ExplicitExecution::conservation_summary`] into its `DiscreteConservation`
-//! evidence. Single-group explicit only: coupled explicit and multirate stepping are open.
+//! evidence. Invariants are reported by index; a caller that knows what each weight vector
+//! conserves (Finitum's realization declares only the vectors today) names them through
+//! [`ExplicitExecution::with_invariant_labels`], and every balance check and the per-invariant
+//! summary then carry the [`InvariantLabel`] (name and conserved component). Single-group
+//! explicit only: coupled explicit and multirate stepping are open.
 
 use serde::{Deserialize, Serialize};
 
@@ -53,7 +57,44 @@ pub fn explicit_config_identity(config: &ExplicitConfig) -> String {
     )
 }
 
+/// Schema tag of [`InvariantLabel`].
+pub const INVARIANT_LABEL_SCHEMA: &str = "krasis-invariant-label/1";
+
+/// The caller-declared meaning of one linear invariant `w_k·y` of an `ExplicitOperator`
+/// (`krasis-invariant-label/1`): a name (`"mass"`, `"momentum-x"`, `"energy"`, ...) and, for a
+/// system of several conserved components, the index of the component the weight vector sums.
+/// Krasis assigns no meaning itself: the labels are telemetry naming, declared through
+/// [`ExplicitExecution::with_invariant_labels`], and take no part in the configuration or
+/// checkpoint identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvariantLabel {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<usize>,
+}
+
+impl InvariantLabel {
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            component: None,
+        }
+    }
+
+    #[must_use]
+    pub fn component(name: impl Into<String>, component: usize) -> Self {
+        Self {
+            name: name.into(),
+            component: Some(component),
+        }
+    }
+}
+
 /// One invariant balance of an accepted step checked against the a priori round-off bound.
+/// `label` is present only when the execution declared invariant labels
+/// ([`ExplicitExecution::with_invariant_labels`]); without them the check serializes exactly as
+/// before (W12).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InvariantBalanceCheck {
     /// `|balance_residual| / scale`; `None` when `scale` is zero.
@@ -62,6 +103,9 @@ pub struct InvariantBalanceCheck {
     pub bound: f64,
     /// `|balance_residual| <= bound`.
     pub within_bound: bool,
+    /// The declared label of this invariant, when the execution has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<InvariantLabel>,
 }
 
 /// Telemetry of one committed explicit step.
@@ -106,6 +150,20 @@ pub struct ExplicitRefusedAttempt {
     pub retry_ceiling: Option<f64>,
 }
 
+/// The balance of one linear invariant over a run of committed steps.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InvariantConservationSummary {
+    /// Position in the operator's `linear_invariants()`.
+    pub index: usize,
+    /// The declared label, when the execution has one.
+    pub label: Option<InvariantLabel>,
+    /// Largest `|balance_residual| / scale` over every step; `+∞` when a balance with zero
+    /// scale has a nonzero residual.
+    pub max_relative_imbalance: f64,
+    /// Every step's balance of this invariant lies within its bound.
+    pub within_bound: bool,
+}
+
 /// Linear-invariant balance over a run of committed steps, for Sinbad's
 /// `DiscreteConservation` evidence.
 #[derive(Clone, Debug, PartialEq)]
@@ -121,6 +179,8 @@ pub struct ExplicitConservationSummary {
     pub within_bound: bool,
     /// Every step's balance was corrected by declared boundary/source rates.
     pub balance_corrected: bool,
+    /// One entry per invariant, in operator order, each named by its label when declared.
+    pub per_invariant: Vec<InvariantConservationSummary>,
 }
 
 /// Serializable restart data of an [`ExplicitExecution`]: the Krasis committed state and the
@@ -144,6 +204,7 @@ pub struct ExplicitExecution<Op: ExplicitOperator + OperatorIdentity> {
     attempt_budget: usize,
     state: SimulationState,
     integrator: ExplicitState,
+    invariant_labels: Vec<InvariantLabel>,
     steps: Vec<ExplicitStepRecord>,
     rejections: Vec<ExplicitRejectionRecord>,
     refusals: Vec<ExplicitRefusedAttempt>,
@@ -209,6 +270,7 @@ impl<Op: ExplicitOperator + OperatorIdentity> ExplicitExecution<Op> {
             attempt_budget,
             state,
             integrator,
+            invariant_labels: Vec::new(),
             steps: Vec::new(),
             rejections: Vec::new(),
             refusals: Vec::new(),
@@ -217,8 +279,54 @@ impl<Op: ExplicitOperator + OperatorIdentity> ExplicitExecution<Op> {
         Ok(execution)
     }
 
+    /// Declares what each of the operator's linear invariants conserves, one label per entry of
+    /// `linear_invariants()` in the same order. Every later [`InvariantBalanceCheck`] and the
+    /// [`InvariantConservationSummary`] carry the label. Refused
+    /// ([`KrasisError::InvalidCoupling`]) when the count differs from the operator's invariant
+    /// count, a name is empty, two labels coincide (same name and component), or a step has
+    /// already been recorded (labels are declared before stepping, so one run's telemetry is
+    /// uniformly named). Labels are not part of the configuration or checkpoint identity: a
+    /// checkpoint restores regardless of them.
+    pub fn with_invariant_labels(
+        mut self,
+        labels: Vec<InvariantLabel>,
+    ) -> Result<Self, KrasisError> {
+        let expected = self.operator.linear_invariants().len();
+        if labels.len() != expected {
+            return Err(KrasisError::InvalidCoupling(format!(
+                "{} invariant labels declared for an operator with {expected} linear invariants",
+                labels.len()
+            )));
+        }
+        if !self.steps.is_empty() {
+            return Err(KrasisError::InvalidCoupling(
+                "invariant labels must be declared before the first explicit step".into(),
+            ));
+        }
+        for (index, label) in labels.iter().enumerate() {
+            if label.name.is_empty() {
+                return Err(KrasisError::InvalidCoupling(format!(
+                    "invariant label {index} has an empty name"
+                )));
+            }
+            if labels[..index].contains(label) {
+                return Err(KrasisError::InvalidCoupling(format!(
+                    "invariant label {index} (`{}`, component {:?}) repeats an earlier label",
+                    label.name, label.component
+                )));
+            }
+        }
+        self.invariant_labels = labels;
+        Ok(self)
+    }
+
     pub fn operator(&self) -> &Op {
         &self.operator
+    }
+
+    /// The declared invariant labels, in operator order; empty when none were declared.
+    pub fn invariant_labels(&self) -> &[InvariantLabel] {
+        &self.invariant_labels
     }
 
     /// The operator content identity every checkpoint is bound to.
@@ -327,7 +435,8 @@ impl<Op: ExplicitOperator + OperatorIdentity> ExplicitExecution<Op> {
                         .report
                         .invariants
                         .iter()
-                        .map(|balance| {
+                        .enumerate()
+                        .map(|(index, balance)| {
                             let bound = bound_factor * f64::EPSILON * balance.scale;
                             let residual = balance.balance_residual.abs();
                             InvariantBalanceCheck {
@@ -335,6 +444,7 @@ impl<Op: ExplicitOperator + OperatorIdentity> ExplicitExecution<Op> {
                                     .then(|| residual / balance.scale),
                                 bound,
                                 within_bound: residual <= bound,
+                                label: self.invariant_labels.get(index).cloned(),
                             }
                         })
                         .collect();
@@ -400,14 +510,30 @@ impl<Op: ExplicitOperator + OperatorIdentity> ExplicitExecution<Op> {
         Ok(&self.steps[first..])
     }
 
-    /// The linear-invariant balance of every recorded step against its round-off bound.
+    /// The linear-invariant balance of every recorded step against its round-off bound, overall
+    /// and per invariant (named by its label when one was declared).
     pub fn conservation_summary(&self) -> ExplicitConservationSummary {
-        let mut max_relative_imbalance = 0.0_f64;
-        let mut within_bound = true;
-        let mut invariants = 0;
+        let invariants = self
+            .steps
+            .iter()
+            .map(|record| record.balances.len())
+            .max()
+            .unwrap_or(0);
+        let mut per_invariant: Vec<InvariantConservationSummary> = (0..invariants)
+            .map(|index| InvariantConservationSummary {
+                index,
+                label: self.invariant_labels.get(index).cloned(),
+                max_relative_imbalance: 0.0,
+                within_bound: true,
+            })
+            .collect();
         for record in &self.steps {
-            invariants = invariants.max(record.balances.len());
-            for (check, balance) in record.balances.iter().zip(&record.report.invariants) {
+            for (index, (check, balance)) in record
+                .balances
+                .iter()
+                .zip(&record.report.invariants)
+                .enumerate()
+            {
                 let relative =
                     check
                         .relative_imbalance
@@ -416,21 +542,26 @@ impl<Op: ExplicitOperator + OperatorIdentity> ExplicitExecution<Op> {
                         } else {
                             f64::INFINITY
                         });
-                max_relative_imbalance = max_relative_imbalance.max(relative);
-                within_bound &= check.within_bound;
+                let entry = &mut per_invariant[index];
+                entry.max_relative_imbalance = entry.max_relative_imbalance.max(relative);
+                entry.within_bound &= check.within_bound;
             }
         }
         let bound_factor = (self.operator.dimension() + 4 * self.config.scheme.stages()) as f64;
         ExplicitConservationSummary {
             steps: self.steps.len(),
             invariants,
-            max_relative_imbalance,
+            max_relative_imbalance: per_invariant
+                .iter()
+                .map(|entry| entry.max_relative_imbalance)
+                .fold(0.0, f64::max),
             relative_bound: bound_factor * f64::EPSILON,
-            within_bound,
+            within_bound: per_invariant.iter().all(|entry| entry.within_bound),
             balance_corrected: self
                 .steps
                 .iter()
                 .all(|record| record.report.balance_corrected),
+            per_invariant,
         }
     }
 
